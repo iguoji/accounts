@@ -1,11 +1,13 @@
 /**
  * 对内 HTTP API：
  *  - GET /proxies  基于协议表返回所有可用代理分页列表
- *     参数: protocols(可空/可多次/逗号分隔), page(默认1), count(默认20)
+ *     参数: protocols(可空/可多次/逗号分隔), page(默认1, 排序最新在前), count(默认20)
  *     返回: JSON 数组 [{ip, port, protocols:[..]}]
  *  - GET /proxy    基于协议表随机返回一个可用代理，无则返回空对象
  *     参数: protocols
  *     返回: JSON 对象 {ip, port, protocols:[..]} 或 {}
+ *  - GET /stats    返回系统运行心跳信息（代理数量、最近采集/测活时间等）
+ *     返回: JSON 对象，见 db.getStats()
  */
 import { createServer } from 'node:http';
 import type { Server, IncomingMessage, ServerResponse } from 'node:http';
@@ -90,6 +92,12 @@ export function createApiServer(db: Database, cfg: AppConfig): Server {
         return;
       }
 
+      // 心跳/体检：返回系统运行状态，用于判断服务是否仍在下工作
+      if (pathname === '/stats') {
+        writeJson(res, 200, db.getStats());
+        return;
+      }
+
       writeJson(res, 404, { error: 'not found' });
     } catch (e) {
       logger.error(`API 处理失败(${url}): ${String(e)}`);
@@ -98,7 +106,7 @@ export function createApiServer(db: Database, cfg: AppConfig): Server {
   });
 
   server.listen(cfg.port, cfg.host, () => {
-    logger.info(`HTTP API 已启动: http://${cfg.host}:${cfg.port} (GET /proxies, /proxy)`);
+    logger.info(`HTTP API 已启动: http://${cfg.host}:${cfg.port} (GET /proxies, /proxy, /stats)`);
   });
   return server;
 }
