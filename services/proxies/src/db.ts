@@ -235,23 +235,35 @@ export class Database {
 
   /**
    * 汇总当前系统运行状态，供 /stats 心跳接口使用。
-   * 返回: 代理池总体规模、可用代理数、以及最近一次采集/测活时间，便于判断系统是否仍在下工作。
+   * 返回: 代理池的候选/可用/从未检测/彻底失效数量，以及最近采集与测活时间，
+   * 便于判断系统是否仍在下工作、进度如何。
    */
   getStats(): StatsItem {
+    const now = Date.now();
     return {
-      proxyProbes: this.pickInt(`SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NULL`),
-      availableProxies: this.pickInt(
+      total_candidates: this.pickInt(`SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NULL`),
+      available_count: this.pickInt(
         `SELECT COUNT(DISTINCT ip || ':' || port) AS c FROM protocols WHERE deleted_at IS NULL AND status = 1`,
       ),
-      protocolRows: this.pickInt(`SELECT COUNT(*) AS c FROM protocols WHERE deleted_at IS NULL`),
-      statusOkProxies: this.pickInt(`SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NULL AND status = 1`),
-      lastCollectAt: this.pickStr(`SELECT MAX(updated_at) AS t FROM proxies`),
-      lastCheckAt: this.pickStr(`SELECT MAX(updated_at) AS t FROM protocols`),
+      untested_count: this.pickInt(
+        `SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NULL AND checked_at IS NULL`,
+      ),
+      dead_count: this.pickInt(`SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NOT NULL`),
+      pending_check_count: this.pickInt(
+        `SELECT COUNT(*) AS c FROM proxies WHERE deleted_at IS NULL AND next_check_at <= ?`,
+        now,
+      ),
+      protocol_total: this.pickInt(`SELECT COUNT(*) AS c FROM protocols WHERE deleted_at IS NULL`),
+      protocol_available: this.pickInt(
+        `SELECT COUNT(*) AS c FROM protocols WHERE deleted_at IS NULL AND status = 1`,
+      ),
+      last_collect_at: this.pickStr(`SELECT MAX(updated_at) AS t FROM proxies`),
+      last_check_at: this.pickStr(`SELECT MAX(updated_at) AS t FROM protocols`),
     };
   }
 
-  private pickInt(sql: string): number | null {
-    const r = this.db.prepare(sql).get() as Record<string, any> | undefined;
+  private pickInt(sql: string, ...params: (number | string)[]): number | null {
+    const r = this.db.prepare(sql).get(...params) as Record<string, any> | undefined;
     const v = r ? r[Object.keys(r)[0]] : null;
     return v === null || v === undefined ? null : Number(v);
   }
@@ -264,16 +276,22 @@ export class Database {
 }
 
 export interface StatsItem {
-  /** 代理表总数（未软删） */
-  proxyProbes: number | null;
-  /** 当前可用代理数（协议表去重） */
-  availableProxies: number | null;
-  /** 协议表有效记录数 */
-  protocolRows: number | null;
-  /** 代理表被标记为可用的数量 */
-  statusOkProxies: number | null;
+  /** 候选代理总数（采集入库且未软删） */
+  total_candidates: number | null;
+  /** 当前判定可用的代理数（协议表去重，/proxies 返回的就是这批） */
+  available_count: number | null;
+  /** 从未检测过的代理数（已采集但还没测活） */
+  untested_count: number | null;
+  /** 已彻底失效（软删）的代理数 */
+  dead_count: number | null;
+  /** 已到检测时间、正在有待测活队列的代理数 */
+  pending_check_count: number | null;
+  /** 协议表有效记录总数 */
+  protocol_total: number | null;
+  /** 协议表判定可用的记录总数 */
+  protocol_available: number | null;
   /** 最近一次采集/入库时间 */
-  lastCollectAt: string | null;
+  last_collect_at: string | null;
   /** 最近一次测活更新时间 */
-  lastCheckAt: string | null;
+  last_check_at: string | null;
 }
