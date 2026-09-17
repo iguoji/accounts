@@ -2,8 +2,12 @@
  * 系统日志，按 yyyy-mm-dd.log 记录到 {LOG_DIR}。
  * 仅记录系统运行相关信息，不记录测活结果明细。
  * 自动删除超过一个月的日志文件。
+ *
+ * 调试模式（DEBUG 开启时）：
+ * - 所有调试日志（测活、采集、调度、重试等细节）写入 debug.log
+ * - 服务启动时清空 debug.log，重新开始记录
  */
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { LOG_DIR } from './config.js';
 
@@ -42,6 +46,27 @@ export function cleanOldLogs(): void {
   }
 }
 
+/** 调试模式开关，由 setDebugEnabled 在服务启动时设置。 */
+let debugEnabled = false;
+const DEBUG_FILE = join(LOG_DIR, 'debug.log');
+
+/** 启用调试模式：开启后 debug() 输出会写入 debug.log，并清空旧的 debug.log 内容。 */
+export function setDebugEnabled(enabled: boolean): void {
+  debugEnabled = enabled;
+  if (enabled) {
+    try {
+      writeFileSync(DEBUG_FILE, '', 'utf8');
+    } catch {
+      // 清空失败不阻断主流程。
+    }
+  }
+}
+
+/** 当前是否处于调试模式。 */
+export function isDebug(): boolean {
+  return debugEnabled;
+}
+
 function write(level: string, msg: string): void {
   const line = `[${nowStamp()}] [${level}] ${msg}`;
   try {
@@ -54,8 +79,20 @@ function write(level: string, msg: string): void {
   console.log(line);
 }
 
+/** 调试日志：仅在调试模式开启时写入 debug.log，不进主日志、不进控制台（避免刷屏）。 */
+function writeDebug(level: string, msg: string): void {
+  if (!debugEnabled) return;
+  const line = `[${nowStamp()}] [${level}] ${msg}`;
+  try {
+    appendFileSync(DEBUG_FILE, line + '\n', 'utf8');
+  } catch {
+    // 调试日志写入失败忽略。
+  }
+}
+
 export const logger = {
   info: (msg: string) => write('INFO', msg),
   warn: (msg: string) => write('WARN', msg),
   error: (msg: string) => write('ERROR', msg),
+  debug: (msg: string) => writeDebug('DEBUG', msg),
 };

@@ -46,13 +46,42 @@ export function typeToScheme(type: number): string {
 export interface ProxyAddr {
   ip: string;
   port: number;
+  /** 可选的认证用户名（源行含 username:password@ 时存在） */
+  username?: string;
+  /** 可选的认证密码 */
+  password?: string;
 }
 
-/** 数据库中的代理记录（用于测活调度）。 */
-export interface ProxyRecord {
-  ip: string;
-  port: number;
-  consecutiveFail: number;
+/**
+ * 构造 Redis 中使用的代理标识。
+ * IPv6 使用方括号包裹，认证信息进行百分号编码，避免冒号造成字段歧义。
+ */
+export function formatAddrKey(proxy: ProxyAddr): string {
+  const host = proxy.ip.includes(':') ? `[${proxy.ip}]` : proxy.ip;
+  if (proxy.username === undefined) return `${host}:${proxy.port}`;
+  return `${host}:${proxy.port}:${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password ?? '')}`;
+}
+
+/** 从代理标识中还原结构化地址。兼容历史 IPv4 标识。 */
+export function parseAddrKey(addrKey: string): ProxyAddr | null {
+  const match = addrKey.startsWith('[')
+    ? /^\[([^\]]+)]:(\d+)(?::([^:]*):(.*))?$/.exec(addrKey)
+    : /^([^:]+):(\d+)(?::([^:]*):(.*))?$/.exec(addrKey);
+  if (!match) return null;
+
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+
+  const result: ProxyAddr = { ip: match[1], port };
+  if (match[3] !== undefined) {
+    try {
+      result.username = decodeURIComponent(match[3]);
+      result.password = decodeURIComponent(match[4] ?? '');
+    } catch {
+      return null;
+    }
+  }
+  return result;
 }
 
 /**

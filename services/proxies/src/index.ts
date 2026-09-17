@@ -1,26 +1,31 @@
 /**
  * 代理池服务入口。
  * 启动时：
- *  1. 初始化数据库表结构
+ *  1. 连接 Redis
  *  2. 立即执行第一轮采集，并按 FETCH_INTERVAL 定时采集
  *  3. 启动测活调度循环（按 INTERVAL / 指数退避 维护各代理检测节奏）
- *  4. 启动对内 HTTP API（/proxies、/proxy）
+ *  4. 启动对内 HTTP API（/proxies、/proxy、/stats）
  */
 import { loadConfig } from './config.js';
 import { Database } from './db.js';
-import { logger, cleanOldLogs } from './logger.js';
+import { logger, cleanOldLogs, setDebugEnabled } from './logger.js';
 import { loadUrls, runCollection } from './collect.js';
 import { startProbeLoop } from './probeLoop.js';
 import { createApiServer } from './api.js';
 
-async function collectSchedule(db: Database, fetchIntervalSec: number, fetchTimeoutSec: number): Promise<void> {
+async function collectSchedule(
+  db: Database,
+  fetchIntervalSec: number,
+  fetchTimeoutSec: number,
+  fetchConcurrency: number,
+): Promise<void> {
   const run = async (): Promise<void> => {
     try {
       const urls = loadUrls();
       logger.info(`开始采集，共 ${urls.length} 个数据源`);
-      const n = await runCollection(urls, { fetchTimeout: fetchTimeoutSec }, db);
+      const n = await runCollection(urls, { fetchTimeout: fetchTimeoutSec, fetchConcurrency }, db);
       logger.info(`采集完成，入库 ${n} 个地址`);
-      cleanOldLogs(); // 顺带清理过期日志
+      cleanOldLogs();
     } catch (e) {
       logger.error(`采集失败（等待下一次）: ${String(e)}`);
     }
@@ -30,50 +35,76 @@ async function collectSchedule(db: Database, fetchIntervalSec: number, fetchTime
   setInterval(run, fetchIntervalSec * 1000);
 }
 
-// 测活时与大量代理打交道，node 网络层对“代理不可用”（对方断连、拒绝、TLS 握手失败、
-// 超时等）会直接 throw 成 uncaughtException，这不是代码 bug，而是代理自身的问题，
-// 按约定应静默（其结果由测活记录为失效，不入系统日志）。这里按错误特征把这类代理
-// 连接错误静默吞掉，只对真正的运行时故障记 ERROR。
-function isProxyNetworkError(err: unknown): boolean {
-  const code: unknown = (err as any)?.code;
-  const msg: string = String((err as any)?.message ?? '');
-  const NET_CODES = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EAI_AGAIN', 'ERR_SOCKET_BAD_PORT'];
-  if (typeof code === 'string' && NET_CODES.includes(code)) return true;
-  return /socket disconnected|secure TLS|handshake|timeout|tls/i.test(msg);
+/**
+ * 判断一个错误是否属于测活连接的噪音（代理失效的副产物）。
+ * 这类错误源于坏代理在 TLS/SOCKS 握手阶段的连接异常，与系统本身无关，
+ * 不应该写日志刷屏（见 README：日志保存的是系统相关信息，并非测活结果）。
+ */
+function isProbeConnectionNoise(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('TLS connection was established') ||
+    msg.includes('socket disconnected before secure TLS') ||
+    msg.includes('connect ECONNREFUSED') ||
+    msg.includes('connect ETIMEDOUT') ||
+    msg.includes('connect ENETUNREACH') ||
+    msg.includes('connect EHOSTUNREACH') ||
+    msg.includes('socks') ||
+    msg.includes('SOCKS') ||
+    msg.includes('tunneling socket') ||
+    msg.includes('hard-timeout') ||
+    msg.includes('getaddrinfo')
+  );
 }
 
 async function main(): Promise<void> {
   process.on('uncaughtException', (err) => {
-    if (isProxyNetworkError(err)) return; // 代理连通性错误：静默，不打扰日志
-    logger.error(`未捕获异常（已忽略）: ${String(err)}`);
+    // 测活连接的噪音（坏代理的 TLS 握手异常等）静默，不写日志；
+    // 其余才是真正的系统故障，需要记录。
+    if (!isProbeConnectionNoise(err)) {
+      logger.error(`未捕获异常（已忽略）: ${String(err)}`);
+    }
   });
   process.on('unhandledRejection', (reason) => {
-    logger.error(`未处理的 Promise 拒绝（已忽略）: ${String(reason)}`);
+    if (!isProbeConnectionNoise(reason)) {
+      logger.error(`未处理的 Promise 拒绝（已忽略）: ${String(reason)}`);
+    }
   });
 
   const cfg = loadConfig();
-  const db = new Database();
-  db.init();
+  setDebugEnabled(cfg.debug);
+  if (cfg.debug) logger.info('调试模式已开启，详细日志输出到 logs/proxies/debug.log');
+  const db = new Database(cfg);
+  await db.connect();
+  // 关键：等待 Redis 真正就绪（能响应命令）再启动业务。
+  // 容器启动时 Redis 可能端口已开放但还在从磁盘加载数据（LOADING），
+  // 此时发命令会失败，会导致测活循环启动即终止。
+  await db.waitReady();
+  logger.info(`Redis 已连接且就绪: ${cfg.redisHost}:${cfg.redisPort}`);
+  await db.reconcileStats();
+  logger.info('代理统计已完成分批校准');
+  const queueRepair = await db.reconcileCheckQueue();
+  logger.info(
+    `测活队列已完成分批校准，恢复 ${queueRepair.restored} 个漏失代理，清理 ${queueRepair.removedDead} 个死亡代理`,
+  );
 
   // 采集子任务（立即执行一轮，随后定时执行）
-  void collectSchedule(db, cfg.fetchInterval, cfg.fetchTimeout);
+  void collectSchedule(db, cfg.fetchInterval, cfg.fetchTimeout, cfg.fetchConcurrency);
 
   // 测活子任务
-  startProbeLoop(db, cfg);
+  const probe = startProbeLoop(db, cfg);
 
   // HTTP API
-  createApiServer(db, cfg);
+  createApiServer(db, cfg, probe.getChecking);
 
   // 优雅退出
-  const shutdown = () => {
+  const shutdown = async () => {
     logger.info('收到退出信号，正在关闭...');
-    db.close();
+    await db.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-
-  // 保持进程存活；长生命周期由上述异步任务维持
 }
 
 main().catch((e) => {

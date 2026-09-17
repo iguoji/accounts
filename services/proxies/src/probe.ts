@@ -1,7 +1,8 @@
 /**
  * 测活：对单个代理分别以 HTTP / HTTPS / SOCKS4 / SOCKS5 四个协议并发探测，
  * 成功标准为「通过代理访问测活渠道，返回 HTTP 200 且响应体含非空 IP 文本」。
- * 主渠道失败（含 404）后回退到备用渠道。
+ * 主备渠道都是全球知名网站，理论上永远可用；仅当主渠道返回 404（渠道自身页面问题）
+ * 时才回退到备用渠道，其他失败（超时、连接错误等）一律判定为代理失效。
  *
  * 实现说明：
  * - 每个协议类型选对应的 http.Agent 子类（http-proxy-agent / https-proxy-agent /
@@ -14,10 +15,10 @@ import * as https from 'node:https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { ALL_TYPES, typeToScheme } from './types.js';
-import type { ProbeResult, ProtocolType, ProxyRecord } from './types.js';
+import type { ProbeResult, ProtocolType } from './types.js';
 import type { Database } from './db.js';
-import { fmtTime } from './db.js';
 import type { AppConfig } from './config.js';
+import { logger } from './logger.js';
 
 /** 从响应体中提取非空 IP 文本（IPv4 或 IPv6 均可）。取不到返回空串，视为失败。 */
 export function extractIp(body: string): string {
@@ -40,8 +41,12 @@ function isIpish(s: string): boolean {
 }
 
 /** 根据协议类型构建对应的 http.Agent（可传给 https.request 的 agent 选项）。 */
-function buildAgent(type: ProtocolType, ip: string, port: number): http.Agent {
-  const proxyUri = `${typeToScheme(type)}://${ip}:${port}`;
+function buildAgent(type: ProtocolType, ip: string, port: number, username?: string, password?: string): http.Agent {
+  const auth = username !== undefined
+    ? `${encodeURIComponent(username)}:${encodeURIComponent(password ?? '')}@`
+    : '';
+  const host = ip.includes(':') ? `[${ip}]` : ip;
+  const proxyUri = `${typeToScheme(type)}://${auth}${host}:${port}`;
   let agent: http.Agent;
   switch (type) {
     case 1: // HTTP 代理：对 https 渠道走 CONNECT 隧道
@@ -67,14 +72,37 @@ function buildAgent(type: ProtocolType, ip: string, port: number): http.Agent {
   return agent;
 }
 
-/** 用给定 Agent 请求一个 HTTPS 渠道，返回 {status, body}。超时/失败则抛出。 */
+/** 超时错误：用于区分"代理握手卡死"与"渠道本身返回异常"两类失败。 */
+class TimeoutError extends Error {}
+
+/** 用给定 Agent 请求一个 HTTPS 渠道，返回 {status, body}。超时/失败则抛出。
+ *  关键：硬超时直接 reject promise，绝不依赖 req.destroy 的副作用，
+ *  保证任何情况下 promise 都会在 timeoutMs+1s 内 settle。 */
 async function requestThrough(
   agent: http.Agent,
   url: string,
   timeoutMs: number,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = https.request(
+    let settled = false;
+    let hardTimer: NodeJS.Timeout | undefined;
+    let req: http.ClientRequest | undefined;
+
+    // 统一的收尾：保证只结算一次，并清理定时器与请求。
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      fn();
+      // 收尾后再尝试销毁请求，释放底层连接（即使已经 settle）
+      try {
+        req?.destroy();
+      } catch {
+        // 销毁失败忽略。
+      }
+    };
+
+    req = https.request(
       url,
       {
         method: 'GET',
@@ -85,21 +113,32 @@ async function requestThrough(
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('error', reject);
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+        res.on('error', (e) => finish(() => reject(e)));
+        res.on('end', () =>
+          finish(() => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') })),
+        );
       },
     );
-    req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
 
-    // 关键兜底：当代理连接的底层 socket 在 TLS 握手前就被对端断开时，
-    // 它会在没有监听者的情况下触发未捕获的 'error' 事件，直接导致进程崩溃。
-    // 这里为 socket 预先挂上一个 no-op 监听，把这个错误吸附住不往外冒。
+    // 关键兜底：硬超时直接 reject promise，不依赖 req.destroy 的副作用。
+    // 这样即使 req.destroy 后没有触发 error 事件（socket 已断、lookup 卡住等），
+    // promise 也一定能 settle，绝不永久挂起。
+    hardTimer = setTimeout(() => {
+      finish(() => reject(new TimeoutError('hard-timeout')));
+    }, timeoutMs + 1000);
+
+    req.on('timeout', () => req.destroy(new TimeoutError('timeout')));
+    req.on('error', (e) => finish(() => reject(e)));
+
+    // 关键兜底：socket 连接层的错误吸附。
+    // 坏代理在 TCP 连接 / TLS 握手 / SOCKS 握手阶段被对端断开时，
+    // 底层 socket 会触发 'error' 事件；若此刻 socket 上没有监听者，
+    // 该错误会一路冒泡到进程级 uncaughtException。
     req.on('socket', (sock) => {
-      // 关键兜底：当代理连接的底层 socket 在 TLS 握手前就被对端断开时，
-      // 它会在没有监听者的情况下触发未捕获的 'error' 事件，直接导致进程崩溃。
-      // 这里为 socket 预先挂一个 no-op 监听，把这个错误吸附住不往外冒。
       sock.on('error', () => {});
+      if (typeof (sock as any).once === 'function') {
+        (sock as any).once('error', () => {});
+      }
     });
 
     req.end();
@@ -107,38 +146,81 @@ async function requestThrough(
 }
 
 /**
- * 用给定代理探测渠道：先主渠道，非 200 或体无 IP 则回退备用。
- * 任一成功即判定可用并返回延迟。
+ * 用给定代理探测渠道：先主渠道，仅当主渠道明确返回 404 时才回退备用渠道。
+ *
+ * 设计依据：主备渠道都是全球知名网站，理论上永远可用，所以请求结果反映的是
+ * 代理本身的状态而非渠道状态：
+ *  - 返回 200 且响应体含 IP → 代理可用
+ *  - 返回 404               → 仅这种情况下是渠道自身的问题（页面被挪走等），
+ *                             换备用渠道再试，避免误判代理失效
+ *  - 超时 / 连接错误 / 其他非 200 → 都是代理不通，换备用渠道照样连不上，
+ *                             直接判定失效，不浪费时间
  */
-async function probeChannels(agent: http.Agent, cfg: AppConfig, timeoutMs: number): Promise<{ ok: boolean; latencyMs: number }> {
+async function probeChannels(
+  agent: http.Agent,
+  cfg: AppConfig,
+  timeoutMs: number,
+  label: string,
+): Promise<{ ok: boolean; latencyMs: number; timedOut: boolean }> {
   const start = performance.now();
-  for (const channel of [cfg.primaryChannel, cfg.backupChannel]) {
+  const channels = [cfg.primaryChannel, cfg.backupChannel];
+  for (let i = 0; i < channels.length; i++) {
     try {
-      const r = await requestThrough(agent, channel, timeoutMs);
+      logger.debug(`[测活] ${label} 渠道${i + 1} 开始请求`);
+      const r = await requestThrough(agent, channels[i], timeoutMs);
+      logger.debug(`[测活] ${label} 渠道${i + 1} 返回 status=${r.status}`);
       if (r.status === 200 && extractIp(r.body) !== '') {
-        return { ok: true, latencyMs: Math.round(performance.now() - start) };
+        const ms = Math.round(performance.now() - start);
+        logger.debug(`[测活] ${label} 渠道${i + 1} 成功，延迟 ${ms}ms`);
+        return { ok: true, latencyMs: ms, timedOut: false };
       }
-      // 主渠道 404 等异常：继续尝试备用渠道
-    } catch {
-      // 渠道自身故障：继续尝试备用渠道
+      // 仅当渠道返回 404（渠道自身的问题）时才换备用渠道再试
+      if (r.status !== 404) {
+        const ms = Math.round(performance.now() - start);
+        logger.debug(`[测活] ${label} 渠道${i + 1} 返回 ${r.status}（非 404，判定代理失效）`);
+        return { ok: false, latencyMs: ms, timedOut: false };
+      }
+      logger.debug(`[测活] ${label} 渠道${i + 1} 返回 404（渠道问题），换备用渠道`);
+    } catch (e) {
+      // 超时 / 连接错误：代理不通，换备用渠道也连不上，直接判定失效
+      const ms = Math.round(performance.now() - start);
+      const isTimeout = e instanceof TimeoutError;
+      logger.debug(`[测活] ${label} 渠道${i + 1} ${isTimeout ? '超时' : '异常'}（${ms}ms），判定代理失效`);
+      return { ok: false, latencyMs: ms, timedOut: isTimeout };
     }
   }
-  return { ok: false, latencyMs: Math.round(performance.now() - start) };
+  return { ok: false, latencyMs: Math.round(performance.now() - start), timedOut: false };
 }
 
-/** 对单个协议完整测活：按配置重试，直到成功或耗尽重试次数后销毁 agent。 */
+/** 对单个协议完整测活：按配置重试，直到成功或耗尽重试次数后销毁 agent。
+ *  若某次判定为超时（代理握手卡死），说明代理大概率不通，立即跳出重试，不再浪费时间。 */
 async function probeProtocol(
-  proxy: ProxyRecord,
+  ip: string,
+  port: number,
   type: ProtocolType,
   cfg: AppConfig,
   timeoutMs: number,
+  username?: string,
+  password?: string,
 ): Promise<ProbeResult> {
-  const agent = buildAgent(type, proxy.ip, proxy.port);
+  const typeName = typeToScheme(type);
+  const label = `${ip}:${port}[${typeName}]`;
+  const agent = buildAgent(type, ip, port, username, password);
   try {
     for (let attempt = 0; attempt < cfg.retry; attempt++) {
-      const r = await probeChannels(agent, cfg, timeoutMs);
-      if (r.ok) return { ok: true, latencyMs: r.latencyMs };
+      logger.debug(`[测活] ${label} 第 ${attempt + 1}/${cfg.retry} 次尝试`);
+      const r = await probeChannels(agent, cfg, timeoutMs, label);
+      if (r.ok) {
+        logger.debug(`[测活] ${label} 判定可用`);
+        return { ok: true, latencyMs: r.latencyMs };
+      }
+      // 超时即代理死了，重试无意义，立即返回失败
+      if (r.timedOut) {
+        logger.debug(`[测活] ${label} 超时放弃重试，判定失效`);
+        return { ok: false, latencyMs: null };
+      }
     }
+    logger.debug(`[测活] ${label} 重试 ${cfg.retry} 次均失败，判定失效`);
     return { ok: false, latencyMs: null };
   } finally {
     if (typeof (agent as any).destroy === 'function') {
@@ -151,28 +233,51 @@ async function probeProtocol(
   }
 }
 
-/** 对单个代理测活：并发探测四种协议，维护协议表并维护代理表。 */
-export async function probeProxy(proxy: ProxyRecord, cfg: AppConfig, db: Database): Promise<void> {
+/**
+ * 对单个代理测活：并发探测四种协议，再一次性写入完整结果。
+ * 单个协议即使出现未预期异常，也会转换为失败结果，保证四种协议的旧索引
+ * 都会被本轮结果覆盖，避免代理状态与 available 索引不一致。
+ */
+export async function probeProxy(args: {
+  addrKey: string;
+  ip: string;
+  port: number;
+  username?: string;
+  password?: string;
+  db: Database;
+  cfg: AppConfig;
+}): Promise<void> {
+  const { addrKey, ip, port, username, password, db, cfg } = args;
   const timeoutMs = cfg.timeout * 1000;
-  const started = Date.now();
+  const startedAt = performance.now();
+
+  logger.debug(`[测活] === 开始探测 ${addrKey} ===`);
+
+  const prevConsecFail = await db.getConsecutiveFail(addrKey);
 
   const results = await Promise.all(
-    ALL_TYPES.map(async (type) => {
-      const r = await probeProtocol(proxy, type, cfg, timeoutMs);
-      db.updateProtocol(proxy.ip, proxy.port, type, r.ok, r.latencyMs);
-      return r;
+    ALL_TYPES.map(async (type): Promise<{ type: ProtocolType; ok: boolean }> => {
+      try {
+        const r = await probeProtocol(ip, port, type, cfg, timeoutMs, username, password);
+        return { type, ok: r.ok };
+      } catch (e) {
+        logger.debug(`[测活] ${addrKey}[${typeToScheme(type)}] 未预期异常，按失败处理: ${String(e)}`);
+        return { type, ok: false };
+      }
     }),
   );
 
   const anyOk = results.some((r) => r.ok);
-  const consecFails = anyOk ? 0 : proxy.consecutiveFail + 1;
-  // 失效时指数退避：max(INTERVAL, INTERVAL_BASE^连续失败次数 * INTERVAL)
-  const nextIntervalMs = anyOk
-    ? cfg.interval * 1000
-    : Math.max(cfg.interval, Math.pow(cfg.intervalBase, consecFails) * cfg.interval) * 1000;
-  const deletedAt = !anyOk && consecFails >= cfg.maxConsecutiveFail ? fmtTime(new Date()) : null;
+  const consecFails = anyOk ? 0 : prevConsecFail + 1;
+  await db.finalizeProbe(addrKey, results, anyOk, consecFails, cfg);
 
-  db.updateProxy(proxy.ip, proxy.port, anyOk ? 1 : 0, started, Date.now() + nextIntervalMs, consecFails, deletedAt);
-  // 说明：测活结果（可用/失效）只入数据库，不写系统日志。
-  // 系统日志只保留真正的运行时故障（见 README“日志保存的是系统相关信息，并非测活结果”）。
+  const elapsed = Math.round(performance.now() - startedAt);
+  const okTypes = results
+    .map((r) => (r.ok ? typeToScheme(r.type) : null))
+    .filter(Boolean)
+    .join(',');
+  const verdict = anyOk ? '可用[' + okTypes + ']' : '失效';
+  logger.debug(
+    `[测活] === 结束探测 ${addrKey} 总耗时 ${elapsed}ms | 结果:${verdict} | 连续失败 ${consecFails} ===`,
+  );
 }

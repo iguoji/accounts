@@ -1,7 +1,8 @@
 /**
  * 采集行的解析与地址合法性校验。
- * 源行形如 protocol://ip:port:country，protocol 或 country 极可能缺失，
- * 我们只使用 ip 与 port。
+ * 源行形如 protocol://username:password@ip:port:country，
+ * protocol、username:password、country 均可能缺失，但我们提取 ip、port、
+ * 可选的 username 与 password。
  * 地址合法性为纯规则判断：跳过注释、含非 ASCII（如中文）的行；端口必须在
  * 1~65535；ip 必须是公网单播地址（内网/私有/回环/链路本地/保留/组播/广播一律拒绝）。
  */
@@ -53,7 +54,7 @@ export function isPublicIp(ip: string): boolean {
 }
 
 /**
- * 从一行原始文本解析出 (ip, port)。返回 null 表示不满足条件：
+ * 从一行原始文本解析出 (ip, port, username?, password?)。返回 null 表示不满足条件：
  *  - 空行、注释行、或含非 ASCII 字符（如中文）的行跳过
  *  - 端口必须在 1~65535
  *  - 原始行必须是可解析的 ip + port 形式
@@ -70,19 +71,36 @@ export function parseProxyLine(line: string): ProxyAddr | null {
   const schemeIdx = t.indexOf('://');
   const rest = schemeIdx === -1 ? t : t.slice(schemeIdx + 3);
 
+  // 提取可选的 username:password@ 前缀
+  let restAfterAuth = rest;
+  let username: string | undefined;
+  let password: string | undefined;
+  const atIdx = rest.lastIndexOf('@');
+  if (atIdx !== -1) {
+    const authPart = rest.slice(0, atIdx);
+    restAfterAuth = rest.slice(atIdx + 1);
+    const colonIdx = authPart.indexOf(':');
+    if (colonIdx !== -1) {
+      username = authPart.slice(0, colonIdx);
+      password = authPart.slice(colonIdx + 1);
+    } else {
+      username = authPart;
+    }
+  }
+
   let ip: string | null = null;
   let portStr: string | null = null;
 
   // 形如 [ipv6]:port:country —— 支持带冒号的 IPv6 括号形式
-  const bracket = /^\[([0-9a-fA-F:]+)\]:(\d+)/.exec(rest);
+  const bracket = /^\[([0-9a-fA-F:]+)\]:(\d+)/.exec(restAfterAuth);
   if (bracket) {
     ip = bracket[1];
     portStr = bracket[2];
   } else {
     // 普通 IPv4 形式 ip:port[:country...]
-    const plain = /^(?:\d{1,3}\.){3}\d{1,3}:(\d+)/.exec(rest);
+    const plain = /^(?:\d{1,3}\.){3}\d{1,3}:(\d+)/.exec(restAfterAuth);
     if (!plain) return null;
-    ip = rest.slice(0, rest.indexOf(':'));
+    ip = restAfterAuth.slice(0, restAfterAuth.indexOf(':'));
     portStr = plain[1];
   }
 
@@ -91,5 +109,8 @@ export function parseProxyLine(line: string): ProxyAddr | null {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   if (!isPublicIp(ip)) return null;
 
-  return { ip, port };
+  const result: ProxyAddr = { ip, port };
+  if (username !== undefined) result.username = username;
+  if (password !== undefined) result.password = password;
+  return result;
 }

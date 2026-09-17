@@ -1,18 +1,21 @@
 /**
- * 对内 HTTP API：
- *  - GET /proxies  基于协议表返回所有可用代理分页列表
- *     参数: protocols(可空/可多次/逗号分隔), page(默认1, 排序最新在前), count(默认20)
+ * 对内 HTTP API（异步，对接 Redis 数据层）：
+ *  - GET /proxies  返回所有可用代理分页列表
+ *     参数: protocols(可空/可多次/逗号分隔), page(默认1), count(默认20)
  *     返回: JSON 数组 [{ip, port, protocols:[..]}]
- *  - GET /proxy    基于协议表随机返回一个可用代理，无则返回空对象
+ *  - GET /proxy    随机返回一个可用代理，无则返回空对象
  *     参数: protocols
  *     返回: JSON 对象 {ip, port, protocols:[..]} 或 {}
- *  - GET /stats    返回系统运行心跳信息（代理数量、最近采集/测活时间等）
- *     返回: JSON 对象，见 db.getStats()
+ *  - GET /stats    返回系统运行心跳信息
+ *     proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
+ *     proxy_dead 为已软删的代理数（单独给出，不计入上面等式）
+ *     proxy_checking 为正在测活中的代理数（运行时读数，与 DB 分段有重叠）
+ *     另含最近采集/测活时间、累计采集次数与累计测活次数
  */
 import { createServer } from 'node:http';
 import type { Server, IncomingMessage, ServerResponse } from 'node:http';
 import { NAME_TO_TYPE } from './types.js';
-import type { Database, AvailableItem } from './db.js';
+import type { Database } from './db.js';
 import type { AppConfig } from './config.js';
 import { logger } from './logger.js';
 
@@ -60,12 +63,8 @@ function writeJson(res: ServerResponse, code: number, body: unknown): void {
   res.end(payload);
 }
 
-function trimItem(item: AvailableItem): AvailableItem {
-  return { ip: item.ip, port: item.port, protocols: item.protocols };
-}
-
-export function createApiServer(db: Database, cfg: AppConfig): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+export function createApiServer(db: Database, cfg: AppConfig, getChecking?: () => number): Server {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     const pathname = new URL(url, 'http://localhost').pathname;
 
@@ -77,24 +76,22 @@ export function createApiServer(db: Database, cfg: AppConfig): Server {
     try {
       if (pathname === '/proxies') {
         const q = parseQuery(url);
-        const all = db.listAvailable(q.protocols);
-        const start = (q.page - 1) * q.count;
-        const items = all.slice(start, start + q.count).map(trimItem);
+        const items = await db.listAvailable(q.protocols, q.page, q.count);
         writeJson(res, 200, items);
         return;
       }
 
       if (pathname === '/proxy') {
         const q = parseQuery(url);
-        const all = db.listAvailable(q.protocols);
-        const pick = all.length > 0 ? all[Math.floor(Math.random() * all.length)] : null;
-        writeJson(res, 200, pick ? trimItem(pick) : {});
+        const pick = await db.randomAvailable(q.protocols);
+        writeJson(res, 200, pick ?? {});
         return;
       }
 
-      // 心跳/体检：返回系统运行状态，用于判断服务是否仍在下工作
       if (pathname === '/stats') {
-        writeJson(res, 200, db.getStats());
+        const stats = await db.getStats();
+        const checking = getChecking ? getChecking() : 0;
+        writeJson(res, 200, { ...stats, proxy_checking: checking });
         return;
       }
 
