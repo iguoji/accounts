@@ -20,7 +20,7 @@ services:
     build:
       context: .
       dockerfile: services/proxies/Dockerfile
-    image: accounts-proxies:0.1.0
+    image: accounts-proxies:0.1.1
     container_name: accounts-proxies
     restart: unless-stopped
     depends_on:
