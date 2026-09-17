@@ -192,8 +192,8 @@ const POP_DUE_LUA = `
 `;
 
 /**
- * 在 Redis 内完成协议集合并集、字典序排序和分页。
- * 只把当前页传回 Node.js，避免大集合在网络上传输后再由应用层全量排序。
+ * 在 Redis 内完成协议集合并集、字典序排序、分页和返回字段组装。
+ * 整个请求只往返 Redis 一次，避免取到地址后再次查询 Hash 和协议集合。
  */
 const PAGE_AVAILABLE_LUA = `
   local members = redis.call('SUNION', unpack(KEYS))
@@ -201,20 +201,56 @@ const PAGE_AVAILABLE_LUA = `
 
   local start_index = tonumber(ARGV[1]) + 1
   local end_index = math.min(start_index + tonumber(ARGV[2]) - 1, #members)
-  local page = {}
+  local result = {}
   for i = start_index, end_index do
-    page[#page + 1] = members[i]
+    local addr = members[i]
+    local values = redis.call('HMGET', 'proxy:' .. addr, 'ip', 'port', 'username', 'password')
+    local protocols = {}
+    for protocol_index = 1, 4 do
+      if redis.call('SISMEMBER', 'available:' .. protocol_index, addr) == 1 then
+        protocols[#protocols + 1] = protocol_index
+      end
+    end
+    result[#result + 1] = addr
+    result[#result + 1] = values[1] or false
+    result[#result + 1] = values[2] or false
+    result[#result + 1] = values[3] or false
+    result[#result + 1] = values[4] or false
+    result[#result + 1] = protocols
   end
-  return page
+  return result
 `;
 
-/** 在 Redis 内从协议集合并集中随机选择一个地址。 */
+/** 从协议集合的唯一并集中均匀随机选择一个地址，并同时组装返回字段。 */
 const RANDOM_AVAILABLE_LUA = `
   local members = redis.call('SUNION', unpack(KEYS))
-  if #members == 0 then
-    return false
+  if #members == 0 then return false end
+  local addr = members[math.random(#members)]
+
+  local values = redis.call('HMGET', 'proxy:' .. addr, 'ip', 'port', 'username', 'password')
+  local protocols = {}
+  for protocol_index = 1, 4 do
+    if redis.call('SISMEMBER', 'available:' .. protocol_index, addr) == 1 then
+      protocols[#protocols + 1] = protocol_index
+    end
   end
-  return members[math.random(#members)]
+  return {addr, values[1] or false, values[2] or false, values[3] or false, values[4] or false, protocols}
+`;
+
+/** 一次读取统计 Hash 与元数据，每次调用仍返回 Redis 中的实时值。 */
+const GET_STATS_LUA = `
+  local counts = redis.call('HMGET', KEYS[1], 'total', 'available', 'unchecked', 'cooldown', 'dead')
+  return {
+    counts[1] or false,
+    counts[2] or false,
+    counts[3] or false,
+    counts[4] or false,
+    counts[5] or false,
+    redis.call('GET', KEYS[2]) or false,
+    redis.call('GET', KEYS[3]) or false,
+    redis.call('GET', KEYS[4]) or false,
+    redis.call('GET', KEYS[5]) or false
+  }
 `;
 
 export class Database {
@@ -398,69 +434,49 @@ export class Database {
   async listAvailable(types: number[], page: number, count: number): Promise<AvailableItem[]> {
     const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const start = (page - 1) * count;
-    const pageItems = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
+    const rows = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
       keys,
       arguments: [String(start), String(count)],
-    })) as string[];
-    return this.buildAvailableItems(pageItems);
+    })) as unknown[];
+    return this.parseAvailableRows(rows);
   }
 
   /** 随机返回一个可用代理。types 为协议类型集合（空表示全部）。 */
   async randomAvailable(types: number[]): Promise<AvailableItem | null> {
     const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
-    const addrKey = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
+    const row = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
       keys,
       arguments: [],
-    })) as string | null;
-    if (!addrKey) return null;
-    return (await this.buildAvailableItems([addrKey]))[0] ?? null;
+    })) as unknown[] | null;
+    if (!row) return null;
+    return this.parseAvailableRows(row)[0] ?? null;
   }
 
-  /**
-   * 批量构建接口返回项。
-   * 认证信息通过一个 pipeline 读取，协议状态通过四次 SMISMEMBER 批量查询，
-   * Redis 往返次数不会随分页条数线性增长。
-   */
-  private async buildAvailableItems(addrKeys: string[]): Promise<AvailableItem[]> {
-    if (addrKeys.length === 0) return [];
-
-    const authPipeline = this.redis.multi();
-    for (const addrKey of addrKeys) {
-      authPipeline.hmGet(this.proxyKeyFromAddr(addrKey), ['ip', 'port', 'username', 'password']);
-    }
-
-    const [authRows, protocolFlags] = await Promise.all([
-      authPipeline.execAsPipeline() as Promise<Array<[string | null, string | null, string | null, string | null]>>,
-      Promise.all(
-        ALL_AVAIL_KEYS.map(
-          (key) => this.redis.sendCommand(['SMISMEMBER', key, ...addrKeys]) as Promise<number[]>,
-        ),
-      ),
-    ]);
-
-    return addrKeys.map((addrKey, index) => {
-      const [storedIp, storedPort, username, password] = authRows[index] ?? [];
+  /** 将 Lua 返回的扁平行数据转换为接口对象，每行固定六项。 */
+  private parseAvailableRows(rows: unknown[]): AvailableItem[] {
+    const items: AvailableItem[] = [];
+    for (let offset = 0; offset + 5 < rows.length; offset += 6) {
+      const addrKey = String(rows[offset]);
+      const storedIp = rows[offset + 1] === null ? null : String(rows[offset + 1]);
+      const storedPort = rows[offset + 2] === null ? null : String(rows[offset + 2]);
+      const username = rows[offset + 3] === null ? null : String(rows[offset + 3]);
+      const password = rows[offset + 4] === null ? null : String(rows[offset + 4]);
+      const protocolTypes = rows[offset + 5] as number[];
       const parsed = storedIp && storedPort
         ? { ip: storedIp, port: Number(storedPort) }
         : parseAddrKey(addrKey);
-      if (!parsed) return null;
+      if (!parsed || !Number.isInteger(parsed.port)) continue;
+
       const item: AvailableItem = {
         ip: parsed.ip,
         port: parsed.port,
-        protocols: [],
+        protocols: protocolTypes.map((type) => TYPE_TO_NAME[type] ?? 'http'),
       };
-
       if (username !== null) item.username = username;
       if (password !== null) item.password = password;
-
-      for (let protocolIndex = 0; protocolIndex < protocolFlags.length; protocolIndex++) {
-        if (protocolFlags[protocolIndex][index]) {
-          const type = protocolIndex + 1;
-          item.protocols.push(TYPE_TO_NAME[type] ?? 'http');
-        }
-      }
-      return item;
-    }).filter((item): item is AvailableItem => item !== null);
+      items.push(item);
+    }
+    return items;
   }
 
   /** 批量读取调度候选的结构化连接信息。 */
@@ -591,14 +607,15 @@ export class Database {
    * 状态迁移由 Lua 原子维护，服务启动时再通过分批扫描进行自愈校准。
    */
   async getStats(): Promise<StatsItem> {
-    const [lastCollect, lastCheck, collectCountRaw, checkCountRaw, counts] = await Promise.all([
-      this.redis.get('meta:last_collect'),
-      this.redis.get('meta:last_check'),
-      this.redis.get('meta:collect_count'),
-      this.redis.get('meta:check_count'),
-      this.redis.hmGet(STATS, ['total', 'available', 'unchecked', 'cooldown', 'dead']),
-    ]);
-    const [total, available, unchecked, cooldown, dead] = counts.map((n) => Number(n) || 0);
+    const row = (await this.redis.eval(GET_STATS_LUA, {
+      keys: [STATS, 'meta:last_collect', 'meta:last_check', 'meta:collect_count', 'meta:check_count'],
+      arguments: [],
+    })) as Array<string | null>;
+    const [total, available, unchecked, cooldown, dead] = row.slice(0, 5).map((n) => Number(n) || 0);
+    const lastCollect = row[5];
+    const lastCheck = row[6];
+    const collectCountRaw = row[7];
+    const checkCountRaw = row[8];
 
     return {
       proxy_total: total,
