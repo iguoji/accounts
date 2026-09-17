@@ -1,0 +1,20 @@
+# 需要排除数据源中的注释部分
+
+urls:
+  - https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt
+
+  - https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/refs/heads/main/proxies/all/data.txt
+
+  - https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/all.txt
+
+  - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt
+  - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks4.txt
+  - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt
+
+  - https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/all_proxies.txt
+
+  - https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt
+
+  - https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt
+  - https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/socks4.txt
+  - https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/socks5.txt

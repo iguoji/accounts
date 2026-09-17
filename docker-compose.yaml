@@ -1,0 +1,24 @@
+# 集中管理各个子系统的 docker 服务。
+# 目前仅代理池（services/proxies）。
+# 使用：在仓库根目录执行“docker compose up -d --build proxies”即可构建并启动。
+services:
+  proxies:
+    build:
+      context: .
+      dockerfile: services/proxies/Dockerfile
+    image: accounts-proxies:0.1.0
+    container_name: accounts-proxies
+    restart: unless-stopped
+    environment:
+      # 让容器日志/数据库时间与宿主机一致（本地时区），默认东八区，可按需改 TZ
+      - TZ=Asia/Shanghai
+    ports:
+      # 宿主机 3000 → 容器 3000（改宿主机端口请改左边；容器端口与 .env 的 PORT 对应）
+      - "3000:3000"
+    volumes:
+      # 数据与日志持久化到宿主机，即使删容器也不丢失
+      - ./data:/srv/data
+      - ./logs:/srv/logs
+      # 配置与数据源清单可直接在宿主机编辑，容器内实时生效
+      - ./.env:/srv/.env:ro
+      - ./services/proxies/source.yaml:/srv/services/proxies/source.yaml:ro

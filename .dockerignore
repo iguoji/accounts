@@ -1,0 +1,10 @@
+# 构建上下文排除项：让镜像只包含必要文件，避免把敏感文件、数据与本地产物打进镜像。
+.git
+.gitignore
+.env
+data
+logs
+**/node_modules
+**/dist
+**/*.log
+docker-compose.yaml
