@@ -98,6 +98,7 @@ export interface AppConfig {
   /** Redis 连接 */
   redisHost: string;
   redisPort: number;
+  redisPassword: string;
   /** 调试模式开关：开启后输出测活/采集/调度的详细日志到 debug.log */
   debug: boolean;
   /** 调试日志单个文件最大容量，MB */
@@ -140,6 +141,7 @@ export function loadConfig(): AppConfig {
     backupChannel: 'https://1.0.0.1/cdn-cgi/trace',
     redisHost: strOr(env, 'REDIS_HOST', 'redis'),
     redisPort: intOr(env, 'REDIS_PORT', 6379),
+    redisPassword: strOr(env, 'REDIS_PASSWORD', ''),
     debug: boolOr(env, 'PROXIES_DEBUG', false),
     debugLogMaxMb: Math.max(intOr(env, 'PROXIES_DEBUG_LOG_MAX_MB', 20), 1),
     debugLogKeepFiles: Math.max(intOr(env, 'PROXIES_DEBUG_LOG_KEEP_FILES', 3), 1),

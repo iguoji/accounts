@@ -37,6 +37,7 @@
 
 - Node.js 24，`package.json` 要求版本不低于 24.0.0。
 - TypeScript 6.0.3。
+- Node.js 依赖由 `package-lock.json` 锁定。开发和构建应使用 `npm ci` 严格按照锁文件安装，依赖变更后再使用 `npm install` 更新锁文件。
 - Redis，用于保存代理状态、测活调度队列、可用协议索引和统计信息。
 - 主要依赖：
     - `redis`：连接和操作 Redis。
@@ -180,6 +181,8 @@ proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
 ```
 
 `proxy_dead` 单独计数。`proxy_checking` 是运行时正在测活的数量，可能与数据库状态分段重叠。
+
+测活任务同时具备请求级超时和任务级硬超时。任务级硬超时会沿完整调用链主动取消尚未结束的网络请求，待请求与代理连接清理完成后才释放并发槽位；已取消的任务不会继续写入 Redis，避免后台残留请求造成实际并发失控或旧结果覆盖新结果。
 
 导入接口属于思路逻辑中的规划，当前尚未实现。
 
@@ -326,7 +329,8 @@ PROXIES_DEAD_REVIVE_AFTER       = 21600 # 软删除后再次采集到时允许�
 PROXIES_PROBE_CONCURRENCY       = 50    # 同时测活的代理数量上限
 
 REDIS_HOST                      = redis  # 全系统共用的 Redis 地址
-REDIS_PORT                      = 6379   # Redis 监听、宿主机映射及子系统连接所用端口
+REDIS_PORT                      = 6379   # Redis 在 Compose 内部网络中的监听和连接端口
+REDIS_PASSWORD                  = 请设置强密码 # Redis 服务和子系统连接使用同一密码
 
 PROXIES_DEBUG                   = false
 PROXIES_DEBUG_LOG_MAX_MB        = 20    # debug.log 单个文件最大容量，单位 MB
@@ -334,7 +338,9 @@ PROXIES_DEBUG_LOG_KEEP_FILES    = 3     # 轮转后保留的历史调试日志�
 PROXIES_DEBUG_SUMMARY_INTERVAL  = 60    # 测活状态汇总周期，单位秒
 ```
 
-修改 `REDIS_PORT` 后，Redis 的实际监听端口、宿主机映射端口和代理池连接端口会一起变化，不需要分别修改。使用 Docker Compose 时，`REDIS_HOST` 通常保持为服务名 `redis`。
+修改 `REDIS_PORT` 后，Redis 的内部监听端口和代理池连接端口会一起变化，不需要分别修改。使用 Docker Compose 时，`REDIS_HOST` 通常保持为服务名 `redis`。
+
+Redis 不向宿主机发布端口，因此宿主机、局域网和外网都不能直接连接。代理池等 Compose 内部子系统通过 Compose 默认内部网络使用服务名 `redis` 连接，并使用同一密码认证。
 
 `PROXIES_HOST` 当前同时用于控制代理池进程的监听地址和 Docker 在宿主机上的端口绑定地址。填写 `0.0.0.0` 表示允许从宿主机所有网络接口访问；如只允许本机访问，可填写 `127.0.0.1`。
 

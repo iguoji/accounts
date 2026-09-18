@@ -6,8 +6,8 @@ FROM node:24.21.0-alpine AS build
 WORKDIR /srv
 
 # 先只拷贝依赖清单，利用 Docker 层缓存加速重复构建
-COPY services/proxies/package.json services/proxies/package.json
-RUN cd services/proxies && npm install
+COPY services/proxies/package.json services/proxies/package-lock.json services/proxies/
+RUN cd services/proxies && npm ci
 
 # 拷贝源码并编译
 COPY services/proxies services/proxies

@@ -364,6 +364,7 @@ export class Database {
     this.deadReviveAfterMs = cfg.deadReviveAfter * 1000;
     this.redis = createClient({
       socket: { host: cfg.redisHost, port: cfg.redisPort },
+      password: cfg.redisPassword,
     });
     this.redis.on('error', (e) => logger.error(`Redis 错误: ${String(e)}`));
   }

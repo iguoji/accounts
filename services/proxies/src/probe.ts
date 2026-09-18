@@ -82,6 +82,7 @@ async function requestThrough(
   agent: http.Agent,
   url: string,
   timeoutMs: number,
+  signal: AbortSignal,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -108,6 +109,7 @@ async function requestThrough(
         method: 'GET',
         agent,
         timeout: timeoutMs,
+        signal,
         headers: { 'user-agent': 'accounts-proxies/0.1' },
       },
       (res) => {
@@ -161,12 +163,13 @@ async function probeChannels(
   cfg: AppConfig,
   timeoutMs: number,
   label: string,
+  signal: AbortSignal,
 ): Promise<{ ok: boolean; latencyMs: number; timedOut: boolean }> {
   const start = performance.now();
   const channels = [cfg.primaryChannel, cfg.backupChannel];
   for (let i = 0; i < channels.length; i++) {
     try {
-      const r = await requestThrough(agent, channels[i], timeoutMs);
+      const r = await requestThrough(agent, channels[i], timeoutMs, signal);
       if (r.status === 200 && extractIp(r.body) !== '') {
         const ms = Math.round(performance.now() - start);
         return { ok: true, latencyMs: ms, timedOut: false };
@@ -178,6 +181,7 @@ async function probeChannels(
       }
       logger.debug(`[测活异常样本] ${label} 渠道${i + 1}返回404，改用备用渠道`);
     } catch (e) {
+      if (signal.aborted) throw signal.reason ?? e;
       // 超时 / 连接错误：代理不通，换备用渠道也连不上，直接判定失效
       const ms = Math.round(performance.now() - start);
       const isTimeout = e instanceof TimeoutError;
@@ -195,6 +199,7 @@ async function probeProtocol(
   type: ProtocolType,
   cfg: AppConfig,
   timeoutMs: number,
+  signal: AbortSignal,
   username?: string,
   password?: string,
 ): Promise<ProbeResult> {
@@ -203,7 +208,8 @@ async function probeProtocol(
   const agent = buildAgent(type, ip, port, username, password);
   try {
     for (let attempt = 0; attempt < cfg.retry; attempt++) {
-      const r = await probeChannels(agent, cfg, timeoutMs, label);
+      if (signal.aborted) throw signal.reason ?? new Error('probe-aborted');
+      const r = await probeChannels(agent, cfg, timeoutMs, label, signal);
       if (r.ok) {
         return { ok: true, latencyMs: r.latencyMs };
       }
@@ -237,19 +243,23 @@ export async function probeProxy(args: {
   password?: string;
   db: Database;
   cfg: AppConfig;
+  signal: AbortSignal;
 }): Promise<{ ok: boolean; protocols: string[]; elapsedMs: number; consecutiveFails: number }> {
-  const { addrKey, ip, port, username, password, db, cfg } = args;
+  const { addrKey, ip, port, username, password, db, cfg, signal } = args;
   const timeoutMs = cfg.timeout * 1000;
   const startedAt = performance.now();
 
+  if (signal.aborted) throw signal.reason ?? new Error('probe-aborted');
   const prevConsecFail = await db.getConsecutiveFail(addrKey);
+  if (signal.aborted) throw signal.reason ?? new Error('probe-aborted');
 
   const results = await Promise.all(
     ALL_TYPES.map(async (type): Promise<{ type: ProtocolType; ok: boolean }> => {
       try {
-        const r = await probeProtocol(ip, port, type, cfg, timeoutMs, username, password);
+        const r = await probeProtocol(ip, port, type, cfg, timeoutMs, signal, username, password);
         return { type, ok: r.ok };
       } catch (e) {
+        if (signal.aborted) throw signal.reason ?? e;
         logger.debug(`[测活异常样本] ${addrKey}[${typeToScheme(type)}] 未预期异常: ${String(e)}`);
         return { type, ok: false };
       }
@@ -258,6 +268,8 @@ export async function probeProxy(args: {
 
   const anyOk = results.some((r) => r.ok);
   const consecFails = anyOk ? 0 : prevConsecFail + 1;
+  // 任务级硬超时后禁止旧任务继续落库，避免过期结果覆盖后续测活结果。
+  if (signal.aborted) throw signal.reason ?? new Error('probe-aborted');
   await db.finalizeProbe(addrKey, results, anyOk, consecFails, cfg);
 
   const elapsed = Math.round(performance.now() - startedAt);

@@ -15,9 +15,8 @@ services:
       - "1000"
       - --port
       - "${REDIS_PORT}"
-    ports:
-      # Redis 监听端口与宿主机映射端口统一由根目录 .env 管理。
-      - "${REDIS_PORT}:${REDIS_PORT}"
+      - --requirepass
+      - "${REDIS_PASSWORD}"
     volumes:
       # Redis 持久化数据（AOF + RDB），即使删容器也不丢失
       - ./data/redis:/data
@@ -37,6 +36,7 @@ services:
       # Redis 连接、代理池监听地址及端口均从根目录 .env 注入。
       REDIS_HOST: "${REDIS_HOST}"
       REDIS_PORT: "${REDIS_PORT}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXIES_HOST: "${PROXIES_HOST}"
       PROXIES_PORT: "${PROXIES_PORT}"
       PROXIES_DEAD_REVIVE_AFTER: "${PROXIES_DEAD_REVIVE_AFTER:-21600}"

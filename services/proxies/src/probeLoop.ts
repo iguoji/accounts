@@ -85,15 +85,24 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
           // 单个代理最坏耗时兜底：
           // 4 个协议并发，每个协议最坏 = 超时（超时即放弃重试和备用渠道）+ 1 秒硬超时缓冲，
           // 再加 Redis 写入等开销，整体约 超时×1×2 + 10 秒缓冲。
-          // 超出此值说明底层 promise 因未知原因永久挂起，强制释放槽位，
-          // 绝不让单个坏代理永久占用并发槽位导致整个循环停转。
+          // 超出此值说明底层任务出现异常卡顿，主动取消完整测活调用链。
+          // 并发槽位在请求与 Agent 清理完成、任务真正退出后释放，避免后台残留请求突破并发上限。
           const maxProbeMs = cfg.timeout * 1000 * 2 + 10000;
-          const task = probeProxy({ addrKey, ip, port, username, password, db, cfg });
-          let timeoutId: ReturnType<typeof setTimeout>;
-          const timeoutGuard = new Promise<never>((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error('hard-timeout')), maxProbeMs);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => {
+            controller.abort(new Error('hard-timeout'));
+          }, maxProbeMs);
+          const task = probeProxy({
+            addrKey,
+            ip,
+            port,
+            username,
+            password,
+            db,
+            cfg,
+            signal: controller.signal,
           });
-          void Promise.race([task, timeoutGuard])
+          void task
             .then((result) => {
               completed++;
               if (result.ok) succeeded++; else failed++;
