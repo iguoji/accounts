@@ -62,12 +62,20 @@ function boolOr(target: Record<string, string>, key: string, def: boolean): bool
 }
 
 export interface AppConfig {
-  /** 采集间隔，秒 */
-  fetchInterval: number;
   /** 数据源下载超时，秒 */
   fetchTimeout: number;
-  /** 同时下载的数据源数量 */
-  fetchConcurrency: number;
+  /** 新源头或历史不足时的默认检查间隔，秒 */
+  sourceDefaultInterval: number;
+  /** 源头检查的最短间隔，秒 */
+  sourceMinInterval: number;
+  /** 源头检查的最长间隔，秒 */
+  sourceMaxInterval: number;
+  /** 源头请求失败后的初始退避时间，秒 */
+  sourceFailureInterval: number;
+  /** 同一站点触发 403/429 后的冷却时间，秒 */
+  sourceSiteCooldown: number;
+  /** 每个源头保留的采集历史条数 */
+  sourceLogMaxLength: number;
   /** 测活间隔，秒 */
   interval: number;
   /** 指数退避递增倍数基数 */
@@ -94,22 +102,35 @@ export interface AppConfig {
 
 export function loadConfig(): AppConfig {
   const env = readEnvFile();
+  const sourceMinInterval = Math.max(intOr(env, 'PROXIES_SOURCE_MIN_INTERVAL', 300), 1);
+  const sourceMaxInterval = Math.max(
+    intOr(env, 'PROXIES_SOURCE_MAX_INTERVAL', 86400),
+    sourceMinInterval,
+  );
+  const sourceDefaultInterval = Math.min(
+    Math.max(intOr(env, 'PROXIES_SOURCE_DEFAULT_INTERVAL', 3600), sourceMinInterval),
+    sourceMaxInterval,
+  );
   return {
-    port: intOr(env, 'PORT', 3000),
-    host: strOr(env, 'HOST', '0.0.0.0'),
-    fetchInterval: intOr(env, 'FETCH_INTERVAL', 300),
-    fetchTimeout: intOr(env, 'FETCH_TIMEOUT', 30),
-    fetchConcurrency: Math.max(intOr(env, 'FETCH_CONCURRENCY', 4), 1),
-    interval: intOr(env, 'INTERVAL', 300),
-    intervalBase: intOr(env, 'INTERVAL_BASE', 2),
-    timeout: intOr(env, 'TIMEOUT', 5),
-    retry: Math.max(intOr(env, 'RETRY', 3), 1),
-    maxConsecutiveFail: intOr(env, 'MAX_CONSECUTIVE_FAIL', 3),
-    probeConcurrency: intOr(env, 'PROBE_CONCURRENCY', 50),
+    port: intOr(env, 'PROXIES_PORT', 3000),
+    host: strOr(env, 'PROXIES_HOST', '0.0.0.0'),
+    fetchTimeout: intOr(env, 'PROXIES_FETCH_TIMEOUT', 30),
+    sourceDefaultInterval,
+    sourceMinInterval,
+    sourceMaxInterval,
+    sourceFailureInterval: Math.max(intOr(env, 'PROXIES_SOURCE_FAILURE_INTERVAL', 300), 1),
+    sourceSiteCooldown: Math.max(intOr(env, 'PROXIES_SOURCE_SITE_COOLDOWN', 3600), 1),
+    sourceLogMaxLength: Math.max(intOr(env, 'PROXIES_SOURCE_LOG_MAX_LENGTH', 100), 1),
+    interval: intOr(env, 'PROXIES_INTERVAL', 300),
+    intervalBase: intOr(env, 'PROXIES_INTERVAL_BASE', 2),
+    timeout: intOr(env, 'PROXIES_TIMEOUT', 5),
+    retry: Math.max(intOr(env, 'PROXIES_RETRY', 3), 1),
+    maxConsecutiveFail: intOr(env, 'PROXIES_MAX_CONSECUTIVE_FAIL', 3),
+    probeConcurrency: intOr(env, 'PROXIES_PROBE_CONCURRENCY', 50),
     primaryChannel: 'https://checkip.amazonaws.com',
     backupChannel: 'https://1.0.0.1/cdn-cgi/trace',
     redisHost: strOr(env, 'REDIS_HOST', 'redis'),
     redisPort: intOr(env, 'REDIS_PORT', 6379),
-    debug: boolOr(env, 'DEBUG', false),
+    debug: boolOr(env, 'PROXIES_DEBUG', false),
   };
 }

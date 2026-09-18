@@ -31,11 +31,11 @@ services:
       - REDIS_PORT=6379
       # 调试模式：开启后测活/采集/调度的详细日志输出到 logs/proxies/debug.log
       # 每次服务启动会清空 debug.log 重新记录；排查问题后改回 false 关闭
-      - DEBUG=false
+      - PROXIES_DEBUG=false
       # 让容器日志时间与宿主机一致（本地时区），默认东八区，可按需改 TZ
       - TZ=Asia/Shanghai
     ports:
-      # 宿主机 3000 → 容器 3000（改宿主机端口请改左边；容器端口与 .env 的 PORT 对应）
+      # 宿主机 3000 → 容器 3000（改宿主机端口请改左边；容器端口与 .env 的 PROXIES_PORT 对应）
       - "3000:3000"
     volumes:
       # 日志持久化到宿主机，即使删容器也不丢失

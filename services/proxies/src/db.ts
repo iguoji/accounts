@@ -22,6 +22,40 @@ import { parseAddrKey, TYPE_TO_NAME } from './types.js';
 import type { ProxyAddr } from './types.js';
 import type { AppConfig } from './config.js';
 
+export interface SourceState {
+  id: string;
+  url: string;
+  enabled: boolean;
+  contentHash: string;
+  proxySetHash: string;
+  etag: string;
+  lastModified: string;
+  lastCheckedAt: number;
+  lastChangedAt: number;
+  nextCheckAt: number;
+  consecutiveUnchanged: number;
+  consecutiveFail: number;
+  lastHttpStatus: number;
+  changeIntervals: number[];
+}
+
+export interface SourceCheckLog {
+  checkedAt: number;
+  result: string;
+  httpStatus: number;
+  contentChanged: boolean;
+  proxySetChanged: boolean;
+  contentHash: string;
+  proxySetHash: string;
+  validProxyCount: number;
+  addedProxyCount: number;
+  revivedProxyCount: number;
+  elapsedMs: number;
+  nextCheckAt: number;
+  scheduleReason: string;
+  error: string;
+}
+
 /** "YYYY-MM-DD HH:MM:SS"（本地时间）文本格式。 */
 export function fmtTime(d: Date = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0');
@@ -62,6 +96,16 @@ const STATS = 'stats';
 const ALL_AVAIL_KEYS = ['available:1', 'available:2', 'available:3', 'available:4'];
 const UPSERT_BATCH_SIZE = 1000;
 const STATS_SCAN_BATCH_SIZE = 1000;
+const SOURCE_QUEUE = 'source_probe_queue';
+const SOURCE_IDS = 'source_ids';
+const SOURCE_SITE_COOLDOWN_PREFIX = 'source_site_cooldown:';
+
+const POP_DUE_SOURCE_LUA = `
+  local result = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, 1)
+  if #result == 0 then return false end
+  redis.call('ZREM', KEYS[1], result[1])
+  return result[1]
+`;
 
 /**
  * 原子写入一个采集地址，并同步维护统计计数。
@@ -348,6 +392,146 @@ export class Database {
     const now = fmtTime(new Date());
     await this.redis.set('meta:last_collect', now);
     await this.redis.incrBy('meta:collect_count', 1);
+  }
+
+  private sourceKey(sourceId: string): string {
+    return `source:${sourceId}`;
+  }
+
+  async syncSources(sources: Array<{ id: string; url: string }>, initialNextCheckAt: number): Promise<number> {
+    if (sources.length === 0) return 0;
+    const pipeline = this.redis.multi();
+    for (const source of sources) {
+      const key = this.sourceKey(source.id);
+      pipeline.sAdd(SOURCE_IDS, source.id);
+      pipeline.hSetNX(key, 'url', source.url);
+      pipeline.hSetNX(key, 'enabled', '1');
+      pipeline.hSetNX(key, 'status', 'pending');
+      pipeline.hSetNX(key, 'content_hash', '');
+      pipeline.hSetNX(key, 'proxy_set_hash', '');
+      pipeline.hSetNX(key, 'etag', '');
+      pipeline.hSetNX(key, 'last_modified', '');
+      pipeline.hSetNX(key, 'last_checked_at', '0');
+      pipeline.hSetNX(key, 'last_changed_at', '0');
+      pipeline.hSetNX(key, 'next_check_at', String(initialNextCheckAt));
+      pipeline.hSetNX(key, 'consecutive_unchanged', '0');
+      pipeline.hSetNX(key, 'consecutive_fail', '0');
+      pipeline.hSetNX(key, 'last_http_status', '0');
+      pipeline.hSetNX(key, 'last_error', '');
+      pipeline.hSetNX(key, 'change_intervals', '[]');
+      pipeline.zAdd(SOURCE_QUEUE, { score: initialNextCheckAt, value: source.id, NX: true });
+    }
+    await pipeline.execAsPipeline();
+    return sources.length;
+  }
+
+  async popDueSource(nowMs: number): Promise<string | null> {
+    const result = await this.redis.eval(POP_DUE_SOURCE_LUA, {
+      keys: [SOURCE_QUEUE],
+      arguments: [String(nowMs)],
+    });
+    return result === null ? null : String(result);
+  }
+
+  /** 将异常中断或历史版本遗漏的启用源头补回调度队列。 */
+  async repairSourceQueue(nowMs: number): Promise<number> {
+    const sourceIds = await this.redis.sMembers(SOURCE_IDS);
+    let restored = 0;
+    for (const sourceId of sourceIds) {
+      const source = await this.getSource(sourceId);
+      if (!source || !source.enabled) continue;
+      const score = source.nextCheckAt > 0 ? source.nextCheckAt : nowMs;
+      const added = await this.redis.zAdd(
+        SOURCE_QUEUE,
+        { score, value: sourceId },
+        { NX: true },
+      );
+      restored += Number(added) || 0;
+    }
+    return restored;
+  }
+
+  async requeueSource(sourceId: string, nextCheckAt: number): Promise<void> {
+    await this.redis.zAdd(SOURCE_QUEUE, { score: nextCheckAt, value: sourceId });
+  }
+
+  async getSource(sourceId: string): Promise<SourceState | null> {
+    const raw = await this.redis.hGetAll(this.sourceKey(sourceId));
+    if (!raw.url) return null;
+    let changeIntervals: number[] = [];
+    try {
+      const parsed = JSON.parse(raw.change_intervals || '[]');
+      if (Array.isArray(parsed)) changeIntervals = parsed.map(Number).filter(Number.isFinite);
+    } catch {
+      changeIntervals = [];
+    }
+    return {
+      id: sourceId,
+      url: raw.url,
+      enabled: raw.enabled !== '0',
+      contentHash: raw.content_hash || '',
+      proxySetHash: raw.proxy_set_hash || '',
+      etag: raw.etag || '',
+      lastModified: raw.last_modified || '',
+      lastCheckedAt: Number(raw.last_checked_at) || 0,
+      lastChangedAt: Number(raw.last_changed_at) || 0,
+      nextCheckAt: Number(raw.next_check_at) || 0,
+      consecutiveUnchanged: Number(raw.consecutive_unchanged) || 0,
+      consecutiveFail: Number(raw.consecutive_fail) || 0,
+      lastHttpStatus: Number(raw.last_http_status) || 0,
+      changeIntervals,
+    };
+  }
+
+  async saveSource(source: SourceState, status: string, error = ''): Promise<void> {
+    await this.redis.hSet(this.sourceKey(source.id), {
+      url: source.url,
+      enabled: source.enabled ? '1' : '0',
+      status,
+      content_hash: source.contentHash,
+      proxy_set_hash: source.proxySetHash,
+      etag: source.etag,
+      last_modified: source.lastModified,
+      last_checked_at: String(source.lastCheckedAt),
+      last_changed_at: String(source.lastChangedAt),
+      next_check_at: String(source.nextCheckAt),
+      consecutive_unchanged: String(source.consecutiveUnchanged),
+      consecutive_fail: String(source.consecutiveFail),
+      last_http_status: String(source.lastHttpStatus),
+      last_error: error,
+      change_intervals: JSON.stringify(source.changeIntervals.slice(-10)),
+    });
+    if (source.enabled) {
+      await this.redis.zAdd(SOURCE_QUEUE, { score: source.nextCheckAt, value: source.id });
+    }
+  }
+
+  async appendSourceLog(sourceId: string, entry: SourceCheckLog, maxLength: number): Promise<void> {
+    await this.redis.sendCommand([
+      'XADD', `source_log:${sourceId}`, 'MAXLEN', '~', String(maxLength), '*',
+      'checked_at', String(entry.checkedAt),
+      'result', entry.result,
+      'http_status', String(entry.httpStatus),
+      'content_changed', entry.contentChanged ? '1' : '0',
+      'proxy_set_changed', entry.proxySetChanged ? '1' : '0',
+      'content_hash', entry.contentHash,
+      'proxy_set_hash', entry.proxySetHash,
+      'valid_proxy_count', String(entry.validProxyCount),
+      'added_proxy_count', String(entry.addedProxyCount),
+      'revived_proxy_count', String(entry.revivedProxyCount),
+      'elapsed_ms', String(entry.elapsedMs),
+      'next_check_at', String(entry.nextCheckAt),
+      'schedule_reason', entry.scheduleReason,
+      'error', entry.error,
+    ]);
+  }
+
+  async getSiteCooldown(hostname: string): Promise<number> {
+    return Number(await this.redis.get(`${SOURCE_SITE_COOLDOWN_PREFIX}${hostname}`)) || 0;
+  }
+
+  async setSiteCooldown(hostname: string, untilMs: number): Promise<void> {
+    await this.redis.set(`${SOURCE_SITE_COOLDOWN_PREFIX}${hostname}`, String(untilMs));
   }
 
   // -------------------------------------------------------------------------

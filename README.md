@@ -1,6 +1,6 @@
 # 账号管理系统
 
-当前版本：v0.1.2。代理池已改用 Redis 统一维护代理状态、测活调度、可用协议索引和运行统计，并进一步降低高频实时接口调用的资源消耗。
+当前版本：v0.1.2。代理池已改用 Redis 统一维护代理状态、测活调度、可用协议索引和运行统计，并支持依据代理源头的实际变化规律动态安排串行采集。
 
 ## 结构
 
@@ -24,4 +24,4 @@
 
 ### 代理池
 
-请查看 [./services/proxies/AGENTS.md](./services/proxies/AGENTS.md) 和 [./services/proxies/README.md](./services/proxies/README.md) 文件
+请查看 [./services/proxies/README.md](./services/proxies/README.md) 文件。

@@ -1,127 +1,262 @@
-/**
- * 采集：定期从 source.yaml 中的源列表批量下载，逐行解析并去重，
- * 每个数据源独立流式解析，再按固定并发数下载；全部完成后统一合并并入库。
- * 采集失败不影响主流程，等待下一次采集。
- */
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Readable } from 'node:stream';
-import { createInterface } from 'node:readline';
-import { SOURCE_FILE } from './config.js';
+import { SOURCE_FILE, type AppConfig } from './config.js';
 import { logger } from './logger.js';
-import type { Database } from './db.js';
+import type { Database, SourceState } from './db.js';
 import { formatAddrKey, type ProxyAddr } from './types.js';
 import { parseProxyLine } from './parse.js';
 
-/** 从 source.yaml 解析出 urls 列表（仅解析所需的极简 YAML 结构）。 */
+const IDLE_WAIT_MS = 1000;
+
 export function loadUrls(yamlPath: string = SOURCE_FILE): string[] {
   const raw = readFileSync(yamlPath, 'utf8');
-  const urls: string[] = [];
+  const urls = new Set<string>();
   for (const line of raw.split(/\r?\n/)) {
-    const t = line.trim();
-    if (!t || t.startsWith('#') || t.startsWith('--')) continue;
-    // 识别 "- https://..." 形式
-    const m = /^-\s+(-?\s*)?((?:https?:|socks4:|socks5:)\/\/\S+)/.exec(t);
-    if (m) urls.push(m[2].replace(/['"]/g, ''));
+    const value = line.trim();
+    if (!value || value.startsWith('#') || value.startsWith('--')) continue;
+    const matched = /^-\s+(-?\s*)?((?:https?:|socks4:|socks5:)\/\/\S+)/.exec(value);
+    if (matched) urls.add(matched[2].replace(/["']/g, ''));
   }
-  return urls;
+  return [...urls];
 }
 
-/** 从单个 URL 下载到本地临时文件并逐行解析合法公网地址，写入 addrs 集合。 */
-async function collectFromUrl(
-  url: string,
-  timeoutMs: number,
-  log: (s: string) => void,
-): Promise<{ url: string; total: number; valid: number; addrs: Map<string, ProxyAddr> }> {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
-  const addrs = new Map<string, ProxyAddr>();
-  let total = 0;
-  let valid = 0;
+export function normalizeSourceUrl(rawUrl: string): string {
+  const url = new URL(rawUrl);
+  url.hash = '';
+  url.hostname = url.hostname.toLowerCase();
+  if ((url.protocol === 'https:' && url.port === '443') || (url.protocol === 'http:' && url.port === '80')) {
+    url.port = '';
+  }
+  return url.toString();
+}
+
+export function sourceId(url: string): string {
+  return createHash('sha256').update(normalizeSourceUrl(url)).digest('hex');
+}
+
+function hash(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function parseAddresses(content: string): Map<string, ProxyAddr> {
+  const addresses = new Map<string, ProxyAddr>();
+  for (const line of content.split(/\r?\n/)) {
+    const parsed = parseProxyLine(line);
+    if (parsed) addresses.set(formatAddrKey(parsed), parsed);
+  }
+  return addresses;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? Math.round((sorted[middle - 1] + sorted[middle]) / 2)
+    : sorted[middle];
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function scheduleAfterSuccess(source: SourceState, changed: boolean, now: number, cfg: AppConfig) {
+  const base = source.changeIntervals.length > 0
+    ? median(source.changeIntervals)
+    : cfg.sourceDefaultInterval * 1000;
+  const delay = changed ? base : base * Math.pow(1.5, Math.min(source.consecutiveUnchanged, 6));
+  return {
+    at: now + clamp(Math.round(delay), cfg.sourceMinInterval * 1000, cfg.sourceMaxInterval * 1000),
+    reason: changed
+      ? (source.changeIntervals.length > 0 ? '变化间隔中位数' : '默认观察间隔')
+      : '连续未变化退避',
+  };
+}
+
+function scheduleAfterFailure(source: SourceState, now: number, cfg: AppConfig) {
+  const delay = cfg.sourceFailureInterval * 1000 * Math.pow(2, Math.min(source.consecutiveFail - 1, 6));
+  return {
+    at: now + Math.min(delay, cfg.sourceMaxInterval * 1000),
+    reason: '请求失败退避',
+  };
+}
+
+async function processSource(db: Database, cfg: AppConfig, source: SourceState): Promise<void> {
+  const startedAt = Date.now();
+  const hostname = new URL(source.url).hostname.toLowerCase();
+  const cooldownUntil = await db.getSiteCooldown(hostname);
+  if (cooldownUntil > startedAt) {
+    source.nextCheckAt = cooldownUntil;
+    await db.saveSource(source, 'site_cooldown');
+    await db.appendSourceLog(source.id, {
+      checkedAt: startedAt,
+      result: 'site_cooldown',
+      httpStatus: 0,
+      contentChanged: false,
+      proxySetChanged: false,
+      contentHash: source.contentHash,
+      proxySetHash: source.proxySetHash,
+      validProxyCount: 0,
+      addedProxyCount: 0,
+      revivedProxyCount: 0,
+      elapsedMs: Date.now() - startedAt,
+      nextCheckAt: source.nextCheckAt,
+      scheduleReason: '同站点仍处于冷却期',
+      error: '',
+    }, cfg.sourceLogMaxLength);
+    return;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.fetchTimeout * 1000);
+  let result = 'failed';
+  let contentChanged = false;
+  let proxySetChanged = false;
+  let validProxyCount = 0;
+  let addedProxyCount = 0;
+  let revivedProxyCount = 0;
+  let scheduleReason = '';
+  let error = '';
+  let currentHttpStatus = 0;
+
   try {
-    logger.debug(`[采集] 开始下载 ${url}`);
-    const res = await fetch(url, { signal: ctl.signal });
-    if (!res.ok || !res.body) {
-      logger.debug(`[采集] ${url} 返回状态 ${res.status}，跳过`);
-      log(`数据源 ${url} 返回状态 ${res.status}，跳过`);
-      return { url, total, valid, addrs };
-    }
+    const headers: Record<string, string> = {};
+    if (source.etag) headers['If-None-Match'] = source.etag;
+    if (source.lastModified) headers['If-Modified-Since'] = source.lastModified;
+    const response = await fetch(source.url, { headers, signal: controller.signal });
+    const now = Date.now();
+    currentHttpStatus = response.status;
+    source.lastCheckedAt = now;
+    source.lastHttpStatus = currentHttpStatus;
 
-    // 流式逐行处理，避免一次性加载巨型列表到内存。
-    // 全局 fetch 的 res.body 是 Web ReadableStream，需先转成 Node Readable 才能交给 readline。
-    const rl = createInterface({
-      input: Readable.fromWeb(res.body as ReadableStream<Uint8Array>),
-      crlfDelay: Infinity,
-    });
+    if (response.status === 304) {
+      result = 'not_modified';
+      source.consecutiveUnchanged++;
+      source.consecutiveFail = 0;
+      const next = scheduleAfterSuccess(source, false, now, cfg);
+      source.nextCheckAt = next.at;
+      scheduleReason = next.reason;
+    } else if (response.ok) {
+      const content = await response.text();
+      const nextContentHash = hash(content);
+      contentChanged = nextContentHash !== source.contentHash;
+      const addresses = parseAddresses(content);
+      validProxyCount = addresses.size;
+      if (validProxyCount === 0) {
+        throw new Error('响应成功，但没有解析到有效代理');
+      }
+      const nextProxySetHash = hash([...addresses.keys()].sort().join('\n'));
+      proxySetChanged = nextProxySetHash !== source.proxySetHash;
 
-    for await (const line of rl) {
-      total++;
-      const parsed = parseProxyLine(line);
-      if (!parsed) continue;
-      // 去重 key：同一 ip:port 但不同认证视为不同代理
-      const key = formatAddrKey(parsed);
-      addrs.set(key, parsed);
-      valid++;
+      if (proxySetChanged) {
+        const stored = await db.upsertAddresses(addresses);
+        addedProxyCount = stored.newCount;
+        revivedProxyCount = stored.revivedCount;
+        await db.markCollectCompleted();
+      }
+
+      if (contentChanged) {
+        if (source.lastChangedAt > 0) {
+          source.changeIntervals = [...source.changeIntervals, now - source.lastChangedAt].slice(-10);
+        }
+        source.lastChangedAt = now;
+        source.consecutiveUnchanged = 0;
+      } else {
+        source.consecutiveUnchanged++;
+      }
+
+      source.contentHash = nextContentHash;
+      source.proxySetHash = nextProxySetHash;
+      source.etag = response.headers.get('etag') || '';
+      source.lastModified = response.headers.get('last-modified') || '';
+      source.consecutiveFail = 0;
+      result = proxySetChanged ? 'proxy_set_changed' : contentChanged ? 'content_changed' : 'unchanged';
+      const next = scheduleAfterSuccess(source, contentChanged, now, cfg);
+      source.nextCheckAt = next.at;
+      scheduleReason = next.reason;
+    } else {
+      throw new Error(`HTTP ${response.status}`);
     }
-    logger.debug(`[采集] ${url} 解析完成：读取 ${total} 行，合法 ${valid} 个`);
-  } catch (e) {
-    logger.debug(`[采集] 下载/解析 ${url} 失败: ${String(e)}`);
-    log(`下载/解析 ${url} 失败: ${String(e)}`);
+  } catch (caught) {
+    const now = Date.now();
+    source.lastCheckedAt = now;
+    source.consecutiveFail++;
+    error = caught instanceof Error ? caught.message : String(caught);
+    source.lastHttpStatus = currentHttpStatus;
+    if (currentHttpStatus === 403 || currentHttpStatus === 429) {
+      const until = now + cfg.sourceSiteCooldown * 1000;
+      await db.setSiteCooldown(hostname, until);
+      source.nextCheckAt = until;
+      scheduleReason = `站点 HTTP ${currentHttpStatus} 冷却`;
+    } else {
+      const next = scheduleAfterFailure(source, now, cfg);
+      source.nextCheckAt = next.at;
+      scheduleReason = next.reason;
+    }
   } finally {
     clearTimeout(timer);
   }
-  return { url, total, valid, addrs };
+
+  await db.saveSource(source, result, error);
+  await db.appendSourceLog(source.id, {
+    checkedAt: source.lastCheckedAt,
+    result,
+    httpStatus: source.lastHttpStatus,
+    contentChanged,
+    proxySetChanged,
+    contentHash: source.contentHash,
+    proxySetHash: source.proxySetHash,
+    validProxyCount,
+    addedProxyCount,
+    revivedProxyCount,
+    elapsedMs: Date.now() - startedAt,
+    nextCheckAt: source.nextCheckAt,
+    scheduleReason,
+    error,
+  }, cfg.sourceLogMaxLength);
+  logger.info(`源头 ${source.url} 检查完成：${result}，新增 ${addedProxyCount}，复活 ${revivedProxyCount}`);
 }
 
-/** 按固定数量启动采集任务，避免一次并发请求全部数据源。 */
-async function collectWithConcurrency(
-  urls: string[],
-  timeoutMs: number,
-  concurrency: number,
-  log: (s: string) => void,
-): Promise<Array<{ url: string; total: number; valid: number; addrs: Map<string, ProxyAddr> }>> {
-  const results = new Array<Awaited<ReturnType<typeof collectFromUrl>>>(urls.length);
-  let nextIndex = 0;
+export interface CollectionHandle {
+  stop: () => void;
+}
 
-  const worker = async (): Promise<void> => {
-    while (nextIndex < urls.length) {
-      const index = nextIndex++;
-      results[index] = await collectFromUrl(urls[index], timeoutMs, log);
+export async function startCollectionLoop(db: Database, cfg: AppConfig): Promise<CollectionHandle> {
+  const urls = loadUrls().map(normalizeSourceUrl);
+  await db.syncSources(urls.map((url) => ({ id: sourceId(url), url })), Date.now());
+  const restored = await db.repairSourceQueue(Date.now());
+  logger.info(`已同步 ${urls.length} 个兜底源头，恢复 ${restored} 个漏失调度，采集将按源头历史串行调度`);
+  let stopped = false;
+
+  const loop = async (): Promise<void> => {
+    while (!stopped) {
+      let currentSourceId: string | null = null;
+      try {
+        const id = await db.popDueSource(Date.now());
+        if (!id) {
+          await new Promise((resolve) => setTimeout(resolve, IDLE_WAIT_MS));
+          continue;
+        }
+        currentSourceId = id;
+        const source = await db.getSource(id);
+        if (!source || !source.enabled) continue;
+        await processSource(db, cfg, source);
+      } catch (error) {
+        logger.warn(`源头采集调度异常，1 秒后重试: ${String(error)}`);
+        if (currentSourceId) {
+          try {
+            await db.requeueSource(
+              currentSourceId,
+              Date.now() + cfg.sourceFailureInterval * 1000,
+            );
+          } catch (requeueError) {
+            logger.error(`源头 ${currentSourceId} 重新入队失败，将在服务重启时恢复: ${String(requeueError)}`);
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, IDLE_WAIT_MS));
+      }
     }
   };
 
-  const workerCount = Math.min(Math.max(concurrency, 1), urls.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
-}
-
-/**
- * 执行一轮完整采集。跨 URL 去重（只对源列表内去重）。
- */
-export async function runCollection(
-  urls: string[],
-  config: { fetchTimeout: number; fetchConcurrency: number },
-  db: Database,
-  log: (s: string) => void = logger.info,
-): Promise<number> {
-  const addrs = new Map<string, ProxyAddr>();
-  const results = await collectWithConcurrency(
-    urls,
-    config.fetchTimeout * 1000,
-    config.fetchConcurrency,
-    log,
-  );
-
-  // 异步任务只写各自的 Map；此处按数据源原顺序单线程合并，保持跨来源去重语义稳定。
-  for (const result of results) {
-    for (const [key, addr] of result.addrs) addrs.set(key, addr);
-    log(`源 ${result.url}: 读取 ${result.total} 行，合法公网地址 ${result.valid} 个`);
-  }
-  if (addrs.size === 0) {
-    log('本轮未采集到任何地址，跳过入库');
-    return 0;
-  }
-  const { newCount, revivedCount } = await db.upsertAddresses(addrs);
-  await db.markCollectCompleted();
-  log(`采集入库完成：新增 ${newCount} 个，复活 ${revivedCount} 个，总计 ${addrs.size} 个去重地址`);
-  return addrs.size;
+  void loop();
+  return { stop: () => { stopped = true; } };
 }

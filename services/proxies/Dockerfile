@@ -31,7 +31,7 @@ COPY --from=build /srv/services/proxies/source.yaml ./source.yaml
 # 日志目录，运行时由宿主机卷覆盖（见 docker-compose.yaml）
 RUN mkdir -p /srv/logs/proxies
 
-# 容器内端口（与 .env 中 PORT 一致，可覆盖）
+# 容器内端口（与 .env 中 PROXIES_PORT 一致，可覆盖）
 EXPOSE 3000
 
 CMD ["node", "--no-warnings", "dist/index.js"]

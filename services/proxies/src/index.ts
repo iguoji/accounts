@@ -2,38 +2,16 @@
  * 代理池服务入口。
  * 启动时：
  *  1. 连接 Redis
- *  2. 立即执行第一轮采集，并按 FETCH_INTERVAL 定时采集
- *  3. 启动测活调度循环（按 INTERVAL / 指数退避 维护各代理检测节奏）
+ *  2. 同步兜底源头并按历史更新规律串行进行采集
+ *  3. 启动测活调度循环（按 PROXIES_INTERVAL / 指数退避维护各代理检测节奏）
  *  4. 启动对内 HTTP API（/proxies、/proxy、/stats）
  */
 import { loadConfig } from './config.js';
 import { Database } from './db.js';
 import { logger, cleanOldLogs, setDebugEnabled } from './logger.js';
-import { loadUrls, runCollection } from './collect.js';
+import { startCollectionLoop } from './collect.js';
 import { startProbeLoop } from './probeLoop.js';
 import { createApiServer } from './api.js';
-
-async function collectSchedule(
-  db: Database,
-  fetchIntervalSec: number,
-  fetchTimeoutSec: number,
-  fetchConcurrency: number,
-): Promise<void> {
-  const run = async (): Promise<void> => {
-    try {
-      const urls = loadUrls();
-      logger.info(`开始采集，共 ${urls.length} 个数据源`);
-      const n = await runCollection(urls, { fetchTimeout: fetchTimeoutSec, fetchConcurrency }, db);
-      logger.info(`采集完成，入库 ${n} 个地址`);
-      cleanOldLogs();
-    } catch (e) {
-      logger.error(`采集失败（等待下一次）: ${String(e)}`);
-    }
-  };
-
-  await run();
-  setInterval(run, fetchIntervalSec * 1000);
-}
 
 /**
  * 判断一个错误是否属于测活连接的噪音（代理失效的副产物）。
@@ -88,8 +66,8 @@ async function main(): Promise<void> {
     `测活队列已完成分批校准，恢复 ${queueRepair.restored} 个漏失代理，清理 ${queueRepair.removedDead} 个死亡代理`,
   );
 
-  // 采集子任务（立即执行一轮，随后定时执行）
-  void collectSchedule(db, cfg.fetchInterval, cfg.fetchTimeout, cfg.fetchConcurrency);
+  cleanOldLogs();
+  const collection = await startCollectionLoop(db, cfg);
 
   // 测活子任务
   const probe = startProbeLoop(db, cfg);
@@ -100,6 +78,8 @@ async function main(): Promise<void> {
   // 优雅退出
   const shutdown = async () => {
     logger.info('收到退出信号，正在关闭...');
+    collection.stop();
+    probe.stop();
     await db.close();
     process.exit(0);
   };
