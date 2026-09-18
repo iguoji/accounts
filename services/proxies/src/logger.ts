@@ -7,7 +7,7 @@
  * - 所有调试日志（测活、采集、调度、重试等细节）写入 debug.log
  * - 服务启动时清空 debug.log，重新开始记录
  */
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { LOG_DIR } from './config.js';
 
@@ -49,16 +49,43 @@ export function cleanOldLogs(): void {
 /** 调试模式开关，由 setDebugEnabled 在服务启动时设置。 */
 let debugEnabled = false;
 const DEBUG_FILE = join(LOG_DIR, 'debug.log');
+let debugMaxBytes = 20 * 1024 * 1024;
+let debugKeepFiles = 3;
 
 /** 启用调试模式：开启后 debug() 输出会写入 debug.log，并清空旧的 debug.log 内容。 */
-export function setDebugEnabled(enabled: boolean): void {
+export function setDebugEnabled(enabled: boolean, maxMb = 20, keepFiles = 3): void {
   debugEnabled = enabled;
+  debugMaxBytes = Math.max(maxMb, 1) * 1024 * 1024;
+  debugKeepFiles = Math.max(keepFiles, 1);
   if (enabled) {
     try {
       writeFileSync(DEBUG_FILE, '', 'utf8');
     } catch {
       // 清空失败不阻断主流程。
     }
+  }
+}
+
+function rotateDebugLog(incomingBytes: number): void {
+  try {
+    const currentBytes = statSync(DEBUG_FILE).size;
+    if (currentBytes + incomingBytes <= debugMaxBytes) return;
+  } catch {
+    return;
+  }
+  try {
+    rmSync(`${DEBUG_FILE}.${debugKeepFiles}`, { force: true });
+    for (let i = debugKeepFiles - 1; i >= 1; i--) {
+      try {
+        renameSync(`${DEBUG_FILE}.${i}`, `${DEBUG_FILE}.${i + 1}`);
+      } catch {
+        // 不存在的历史文件直接跳过。
+      }
+    }
+    renameSync(DEBUG_FILE, `${DEBUG_FILE}.1`);
+    writeFileSync(DEBUG_FILE, '', 'utf8');
+  } catch {
+    // 轮转失败不阻断主流程，下一次写入时会继续尝试。
   }
 }
 
@@ -84,6 +111,7 @@ function writeDebug(level: string, msg: string): void {
   if (!debugEnabled) return;
   const line = `[${nowStamp()}] [${level}] ${msg}`;
   try {
+    rotateDebugLog(Buffer.byteLength(line + '\n', 'utf8'));
     appendFileSync(DEBUG_FILE, line + '\n', 'utf8');
   } catch {
     // 调试日志写入失败忽略。

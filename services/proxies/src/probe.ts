@@ -166,26 +166,21 @@ async function probeChannels(
   const channels = [cfg.primaryChannel, cfg.backupChannel];
   for (let i = 0; i < channels.length; i++) {
     try {
-      logger.debug(`[测活] ${label} 渠道${i + 1} 开始请求`);
       const r = await requestThrough(agent, channels[i], timeoutMs);
-      logger.debug(`[测活] ${label} 渠道${i + 1} 返回 status=${r.status}`);
       if (r.status === 200 && extractIp(r.body) !== '') {
         const ms = Math.round(performance.now() - start);
-        logger.debug(`[测活] ${label} 渠道${i + 1} 成功，延迟 ${ms}ms`);
         return { ok: true, latencyMs: ms, timedOut: false };
       }
       // 仅当渠道返回 404（渠道自身的问题）时才换备用渠道再试
       if (r.status !== 404) {
         const ms = Math.round(performance.now() - start);
-        logger.debug(`[测活] ${label} 渠道${i + 1} 返回 ${r.status}（非 404，判定代理失效）`);
         return { ok: false, latencyMs: ms, timedOut: false };
       }
-      logger.debug(`[测活] ${label} 渠道${i + 1} 返回 404（渠道问题），换备用渠道`);
+      logger.debug(`[测活异常样本] ${label} 渠道${i + 1}返回404，改用备用渠道`);
     } catch (e) {
       // 超时 / 连接错误：代理不通，换备用渠道也连不上，直接判定失效
       const ms = Math.round(performance.now() - start);
       const isTimeout = e instanceof TimeoutError;
-      logger.debug(`[测活] ${label} 渠道${i + 1} ${isTimeout ? '超时' : '异常'}（${ms}ms），判定代理失效`);
       return { ok: false, latencyMs: ms, timedOut: isTimeout };
     }
   }
@@ -208,19 +203,15 @@ async function probeProtocol(
   const agent = buildAgent(type, ip, port, username, password);
   try {
     for (let attempt = 0; attempt < cfg.retry; attempt++) {
-      logger.debug(`[测活] ${label} 第 ${attempt + 1}/${cfg.retry} 次尝试`);
       const r = await probeChannels(agent, cfg, timeoutMs, label);
       if (r.ok) {
-        logger.debug(`[测活] ${label} 判定可用`);
         return { ok: true, latencyMs: r.latencyMs };
       }
       // 超时即代理死了，重试无意义，立即返回失败
       if (r.timedOut) {
-        logger.debug(`[测活] ${label} 超时放弃重试，判定失效`);
         return { ok: false, latencyMs: null };
       }
     }
-    logger.debug(`[测活] ${label} 重试 ${cfg.retry} 次均失败，判定失效`);
     return { ok: false, latencyMs: null };
   } finally {
     if (typeof (agent as any).destroy === 'function') {
@@ -246,12 +237,10 @@ export async function probeProxy(args: {
   password?: string;
   db: Database;
   cfg: AppConfig;
-}): Promise<void> {
+}): Promise<{ ok: boolean; protocols: string[]; elapsedMs: number; consecutiveFails: number }> {
   const { addrKey, ip, port, username, password, db, cfg } = args;
   const timeoutMs = cfg.timeout * 1000;
   const startedAt = performance.now();
-
-  logger.debug(`[测活] === 开始探测 ${addrKey} ===`);
 
   const prevConsecFail = await db.getConsecutiveFail(addrKey);
 
@@ -261,7 +250,7 @@ export async function probeProxy(args: {
         const r = await probeProtocol(ip, port, type, cfg, timeoutMs, username, password);
         return { type, ok: r.ok };
       } catch (e) {
-        logger.debug(`[测活] ${addrKey}[${typeToScheme(type)}] 未预期异常，按失败处理: ${String(e)}`);
+        logger.debug(`[测活异常样本] ${addrKey}[${typeToScheme(type)}] 未预期异常: ${String(e)}`);
         return { type, ok: false };
       }
     }),
@@ -276,8 +265,10 @@ export async function probeProxy(args: {
     .map((r) => (r.ok ? typeToScheme(r.type) : null))
     .filter(Boolean)
     .join(',');
-  const verdict = anyOk ? '可用[' + okTypes + ']' : '失效';
-  logger.debug(
-    `[测活] === 结束探测 ${addrKey} 总耗时 ${elapsed}ms | 结果:${verdict} | 连续失败 ${consecFails} ===`,
-  );
+  return {
+    ok: anyOk,
+    protocols: okTypes ? okTypes.split(',') : [],
+    elapsedMs: elapsed,
+    consecutiveFails: consecFails,
+  };
 }

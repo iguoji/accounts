@@ -2,7 +2,7 @@
 
 代理池用于收集代理 IP，检测代理支持的协议及当前可用性，并通过内网 HTTP API 向其他服务提供可用代理。
 
-当前版本为 v0.1.3。当前已经实现兜底源头同步、按源头变化规律动态调度、全局串行采集、HTTP、HTTPS、SOCKS4、SOCKS5 四协议测活、Redis 状态维护，以及可用代理查询和运行统计接口。
+当前版本为 v0.1.4。当前已经实现兜底源头同步、按源头变化规律动态调度、全局串行采集、HTTP、HTTPS、SOCKS4、SOCKS5 四协议测活、Redis 状态维护、按业务域名过滤受限出口 IP、业务封禁反馈，以及可用代理查询和运行统计接口。
 
 ## 思路逻辑
 
@@ -96,7 +96,7 @@
 - 成功响应没有解析出任何有效代理时按异常处理，不用空集合覆盖已有摘要。
 - 同一 IP 和端口具有不同认证信息时，视为不同代理。
 - 已存在且未软删除的代理不会重复创建，也不会因为再次采集而刷新状态。
-- 已软删除的代理再次采集到时会被复活，状态重置并重新加入测活队列。
+- 已软删除的代理再次采集到时，只有软删除时间达到 `PROXIES_DEAD_REVIVE_AFTER` 后才会复活；复活后重置为待检测状态并重新加入测活队列，不会直接恢复为可用。
 - 有实际内容变化记录时，使用最近十次变化间隔的中位数推测下次检查时间；历史不足时使用默认间隔；连续未变化和连续失败会逐步延长检查间隔。
 - 403 或 429 会触发同一站点的全局冷却。同站点其他源头在冷却结束前不会发送请求。
 - 请求失败与内容未变化分别记录。单个源头失败不会使采集循环退出，长期失败只保留异常状态，不自动删除源头。
@@ -133,7 +133,7 @@
 
 ### 内网接口
 
-当前接口只接受 GET 请求。
+查询接口接受 GET 请求，业务反馈接口接受 POST 请求。
 
 #### 获取可用代理列表
 
@@ -142,6 +142,7 @@
     - `protocols`：可选。为空时查询所有协议；可以重复传入，也可以使用逗号分隔。
     - `page`：可选，默认为 1。
     - `count`：可选，默认为 20。
+    - `domain`：可选。传入域名或网址后，排除该域名下仍处于封禁期的所有同 IP 代理。
 - 返回：JSON 数组 `[{ip, port, protocols, username?, password?}]`。
 
 多种协议采用并集语义。列表在 Redis 内完成候选集合合并、排序、分页和结果组装，一次请求只往返 Redis 一次。
@@ -151,9 +152,20 @@
 - 地址：`/proxy`
 - 参数：
     - `protocols`：可选，规则与 `/proxies` 相同。
+    - `domain`：可选，规则与 `/proxies` 相同。
 - 返回：一个代理的 JSON 对象；没有符合条件的代理时返回空对象 `{}`。
 
 随机选择以符合协议条件的唯一代理集合为范围。
+
+#### 反馈某个代理无法访问指定网站
+
+- 地址：`/feedback`
+- 方法：`POST`
+- 请求体：`{ip, port, domain, blocked_seconds, reason?}`。
+- `blocked_seconds` 是调用方决定的封禁秒数。代理池信任内部子系统的判断，不解析 HTTP 状态码或验证码内容。
+- `reason` 可选，最多 1000 个字符，只用于日志记录，不参与判断。
+- `ip` 和 `port` 用于确认反馈对应池中已有代理；真正的业务封禁范围按规范化后的 `domain + IP` 保存，不区分端口、协议、账号或密码。
+- 相同 IP 和域名的重复反馈只能延长封禁时间，不能缩短现有封禁。
 
 #### 获取运行状态
 
@@ -169,7 +181,7 @@ proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
 
 `proxy_dead` 单独计数。`proxy_checking` 是运行时正在测活的数量，可能与数据库状态分段重叠。
 
-反馈接口和导入接口属于思路逻辑中的规划，当前尚未实现。
+导入接口属于思路逻辑中的规划，当前尚未实现。
 
 ## 数据结构
 
@@ -188,6 +200,7 @@ proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
 |`status`|0 表示当前不可用，1 表示当前可用|
 |`consecutive_fail`|连续失败次数|
 |`checked_at`|最后检测时间，毫秒时间戳；空字符串表示从未检测|
+|`dead_at`|进入软删池的毫秒时间戳；复活后清空|
 
 ### 源头状态 `source:{source_id}`（Hash）
 
@@ -253,7 +266,11 @@ proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
 
 ### 软删池 `dead_pool`（Set）
 
-保存连续失败达到上限的代理。再次采集到相同代理时，代理会从软删池移出、重置状态并重新加入测活队列。
+保存连续失败达到上限的代理。再次采集到相同代理时，只有 `dead_at` 距今达到配置的等待时间，代理才会从软删池移出、重置状态并重新加入测活队列。历史数据缺少 `dead_at` 时，首次重新采集会补记当前时间，不会立即批量复活。
+
+### 业务域名封禁 `domain_block:{规范化域名}`（Sorted Set）
+
+成员为代理 IP，分值为封禁截止时间的毫秒时间戳。获取代理时如传入 `domain`，会排除分值仍晚于当前时间的 IP。由于网站通常按出口 IP 实施限制，同一 IP 下的所有端口、协议和认证组合都会一并排除。到期记录在查询时自动清理。
 
 ### 统计计数器 `stats`（Hash）
 
@@ -282,13 +299,15 @@ proxy_total = proxy_available + proxy_unchecked + proxy_cooldown
 
 ### 配置
 
-配置统一从仓库根目录的 `../../.env` 读取，也可以通过同名进程环境变量覆盖。
+配置统一从仓库根目录的 `../../.env` 读取，也可以通过同名进程环境变量覆盖。使用 Docker Compose 启动时，根目录的 `docker-compose.yaml` 会读取这些配置，并注入代理池和 Redis 容器。
 
 代理池自身的配置项统一使用 `PROXIES_` 前缀，避免与其他子项目的配置重名。Redis 是多个子项目共同使用的基础服务，因此连接地址使用全局的 `REDIS_HOST` 和 `REDIS_PORT`，不归属于代理池前缀。
 
 ```ini
+TZ                              = Asia/Shanghai  # 所有容器统一使用的时区
+
 PROXIES_PORT                    = 3000  # HTTP API 端口
-PROXIES_HOST                    = 0.0.0.0
+PROXIES_HOST                    = 0.0.0.0 # API 监听地址及 Docker 宿主机端口绑定地址
 
 PROXIES_FETCH_TIMEOUT           = 30    # 单个数据源下载超时，单位秒
 PROXIES_SOURCE_DEFAULT_INTERVAL = 3600  # 新源头或历史不足时的默认检查间隔，单位秒
@@ -303,15 +322,25 @@ PROXIES_INTERVAL_BASE           = 2     # 连续失败时的指数退避基数
 PROXIES_TIMEOUT                 = 5     # 单次测活请求超时，单位秒
 PROXIES_RETRY                   = 3     # 单个协议的最多检测次数
 PROXIES_MAX_CONSECUTIVE_FAIL    = 3     # 连续失败达到此次数后软删除
+PROXIES_DEAD_REVIVE_AFTER       = 21600 # 软删除后再次采集到时允许复活的等待时间，单位秒
 PROXIES_PROBE_CONCURRENCY       = 50    # 同时测活的代理数量上限
 
 REDIS_HOST                      = redis  # 全系统共用的 Redis 地址
-REDIS_PORT                      = 6379   # 全系统共用的 Redis 端口
+REDIS_PORT                      = 6379   # Redis 监听、宿主机映射及子系统连接所用端口
 
 PROXIES_DEBUG                   = false
+PROXIES_DEBUG_LOG_MAX_MB        = 20    # debug.log 单个文件最大容量，单位 MB
+PROXIES_DEBUG_LOG_KEEP_FILES    = 3     # 轮转后保留的历史调试日志数量
+PROXIES_DEBUG_SUMMARY_INTERVAL  = 60    # 测活状态汇总周期，单位秒
 ```
 
+修改 `REDIS_PORT` 后，Redis 的实际监听端口、宿主机映射端口和代理池连接端口会一起变化，不需要分别修改。使用 Docker Compose 时，`REDIS_HOST` 通常保持为服务名 `redis`。
+
+`PROXIES_HOST` 当前同时用于控制代理池进程的监听地址和 Docker 在宿主机上的端口绑定地址。填写 `0.0.0.0` 表示允许从宿主机所有网络接口访问；如只允许本机访问，可填写 `127.0.0.1`。
+
 ### 启动
+
+Docker Compose 构建的本地镜像固定使用 `accounts-proxies:latest`。该标签只表示当前本地构建结果，不跟随代理池程序版本变化；程序版本仍以 `package.json`、README 和正式发布时的 Git 标签为准。
 
 ```bash
 npm run build
@@ -334,7 +363,9 @@ npm run typecheck
 
 普通系统日志存放在 `../../logs/proxies/`，按 `yyyy-mm-dd.log` 命名。超过 30 天的日志会自动删除。
 
-当 `PROXIES_DEBUG=true` 时，采集、测活和调度的详细过程写入 `../../logs/proxies/debug.log`。服务每次启动时会清空该文件。
+当 `PROXIES_DEBUG=true` 时，启动配置摘要、每次源头采集结果、调度异常和测活周期汇总会写入 `../../logs/proxies/debug.log`。正常的逐代理、逐协议请求和每秒空轮询不会逐条记录，避免百万级代理使日志快速膨胀。测活汇总默认每 60 秒记录一次，包括派发、完成、可用、失效、硬超时、并发峰值、耗时与协议成功数量。
+
+调试日志达到 `PROXIES_DEBUG_LOG_MAX_MB` 后自动轮转，并按 `PROXIES_DEBUG_LOG_KEEP_FILES` 保留有限数量的历史文件。服务每次启动时仍会清空当前 `debug.log`，便于 Agent 从本次启动开始判断运行状态。日志不会输出代理认证密码。
 
 日志只用于记录系统运行状态，不保存每个代理的测活结果明细。
 
@@ -350,3 +381,7 @@ npm run typecheck
 - 单个代理或协议检测异常会转换为失败结果，不会使整个测活循环退出。
 - 测活调度循环遇到 Redis 瞬时错误时会等待后重试。
 - 收到 SIGINT 或 SIGTERM 时，服务会停止调度、关闭 HTTP 服务并断开 Redis。
+
+### 常见问题
+
+- 使用 `node-redis` 4.x 调用 `zAdd` 时，`NX`、`XX` 等写入条件属于独立选项，不能写入包含 `score` 和 `value` 的成员对象。项目中的源头队列初始化已按 `zAdd(key, member, options)` 的形式调用，避免 TypeScript 编译时报出 `NX does not exist in type ZMember`。

@@ -99,6 +99,16 @@ const STATS_SCAN_BATCH_SIZE = 1000;
 const SOURCE_QUEUE = 'source_probe_queue';
 const SOURCE_IDS = 'source_ids';
 const SOURCE_SITE_COOLDOWN_PREFIX = 'source_site_cooldown:';
+const DOMAIN_BLOCK_PREFIX = 'domain_block:';
+
+/** 原子写入业务域名封禁，已有截止时间更晚时保持原值。 */
+const BLOCK_FOR_DOMAIN_LUA = `
+  local current = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[1]) or '0')
+  local requested = tonumber(ARGV[2])
+  local final = math.max(current, requested)
+  redis.call('ZADD', KEYS[1], final, ARGV[1])
+  return final
+`;
 
 const POP_DUE_SOURCE_LUA = `
   local result = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, 1)
@@ -119,6 +129,8 @@ const UPSERT_ADDRESS_LUA = `
   local ip = ARGV[5]
   local port = ARGV[6]
   local has_auth = ARGV[7]
+  local now = tonumber(ARGV[8])
+  local revive_after = tonumber(ARGV[9])
 
   if redis.call('SISMEMBER', KEYS[1], addr) == 1 then
     -- 历史数据可能没有结构化地址字段。每次重新采集命中时顺便补齐，
@@ -133,11 +145,22 @@ const UPSERT_ADDRESS_LUA = `
       return 0
     end
 
+    local dead_at = tonumber(redis.call('HGET', proxy_key, 'dead_at') or '') or 0
+    if dead_at == 0 then
+      -- 兼容旧版本软删除数据：首次重新采集时才开始计算等待期。
+      redis.call('HSET', proxy_key, 'dead_at', now)
+      return 0
+    end
+    if now - dead_at < revive_after then
+      return 0
+    end
+
     redis.call('SREM', KEYS[2], addr)
     redis.call('HSET', proxy_key,
       'status', '0',
       'consecutive_fail', '0',
       'checked_at', '',
+      'dead_at', '',
       'ip', ip,
       'port', port)
     redis.call('ZADD', KEYS[3], 0, addr)
@@ -152,6 +175,7 @@ const UPSERT_ADDRESS_LUA = `
     'status', '0',
     'consecutive_fail', '0',
     'checked_at', '',
+    'dead_at', '',
     'ip', ip,
     'port', port)
   if has_auth == '1' then
@@ -198,7 +222,7 @@ const FINALIZE_PROBE_LUA = `
 
   local new_bucket
   if ok then
-    redis.call('HSET', proxy_key, 'status', '1', 'consecutive_fail', '0', 'checked_at', now)
+    redis.call('HSET', proxy_key, 'status', '1', 'consecutive_fail', '0', 'checked_at', now, 'dead_at', '')
     redis.call('ZADD', KEYS[1], next_check, addr)
     redis.call('SREM', KEYS[2], addr)
     new_bucket = 'available'
@@ -206,6 +230,7 @@ const FINALIZE_PROBE_LUA = `
     redis.call('HSET', proxy_key, 'status', '0', 'consecutive_fail', consecutive_fail, 'checked_at', now)
     if consecutive_fail >= max_fail then
       redis.call('SADD', KEYS[2], addr)
+      redis.call('HSET', proxy_key, 'dead_at', now)
       redis.call('ZREM', KEYS[1], addr)
       for i = 1, 4 do redis.call('SREM', KEYS[3 + i], addr) end
       new_bucket = 'dead'
@@ -243,24 +268,41 @@ const PAGE_AVAILABLE_LUA = `
   local members = redis.call('SUNION', unpack(KEYS))
   table.sort(members)
 
-  local start_index = tonumber(ARGV[1]) + 1
-  local end_index = math.min(start_index + tonumber(ARGV[2]) - 1, #members)
+  local start_offset = tonumber(ARGV[1])
+  local limit = tonumber(ARGV[2])
+  local domain_key = ARGV[3]
+  local now = tonumber(ARGV[4])
   local result = {}
-  for i = start_index, end_index do
+  local accepted = 0
+  for i = 1, #members do
     local addr = members[i]
     local values = redis.call('HMGET', 'proxy:' .. addr, 'ip', 'port', 'username', 'password')
-    local protocols = {}
-    for protocol_index = 1, 4 do
-      if redis.call('SISMEMBER', 'available:' .. protocol_index, addr) == 1 then
-        protocols[#protocols + 1] = protocol_index
+    local blocked = false
+    if domain_key ~= '' and values[1] then
+      local blocked_until = tonumber(redis.call('ZSCORE', domain_key, values[1]) or '0')
+      if blocked_until > now then
+        blocked = true
+      elseif blocked_until > 0 then
+        redis.call('ZREM', domain_key, values[1])
       end
     end
-    result[#result + 1] = addr
-    result[#result + 1] = values[1] or false
-    result[#result + 1] = values[2] or false
-    result[#result + 1] = values[3] or false
-    result[#result + 1] = values[4] or false
-    result[#result + 1] = protocols
+    if not blocked then
+      if accepted >= start_offset and #result < limit * 6 then
+        local protocols = {}
+        for protocol_index = 1, 4 do
+          if redis.call('SISMEMBER', 'available:' .. protocol_index, addr) == 1 then
+            protocols[#protocols + 1] = protocol_index
+          end
+        end
+        result[#result + 1] = addr
+        result[#result + 1] = values[1] or false
+        result[#result + 1] = values[2] or false
+        result[#result + 1] = values[3] or false
+        result[#result + 1] = values[4] or false
+        result[#result + 1] = protocols
+      end
+      accepted = accepted + 1
+    end
   end
   return result
 `;
@@ -269,8 +311,24 @@ const PAGE_AVAILABLE_LUA = `
 const RANDOM_AVAILABLE_LUA = `
   local members = redis.call('SUNION', unpack(KEYS))
   if #members == 0 then return false end
-  local addr = members[math.random(#members)]
-
+  local domain_key = ARGV[1]
+  local now = tonumber(ARGV[2])
+  local candidates = {}
+  for i = 1, #members do
+    local values = redis.call('HMGET', 'proxy:' .. members[i], 'ip', 'port', 'username', 'password')
+    local blocked = false
+    if domain_key ~= '' and values[1] then
+      local blocked_until = tonumber(redis.call('ZSCORE', domain_key, values[1]) or '0')
+      if blocked_until > now then
+        blocked = true
+      elseif blocked_until > 0 then
+        redis.call('ZREM', domain_key, values[1])
+      end
+    end
+    if not blocked then candidates[#candidates + 1] = members[i] end
+  end
+  if #candidates == 0 then return false end
+  local addr = candidates[math.random(#candidates)]
   local values = redis.call('HMGET', 'proxy:' .. addr, 'ip', 'port', 'username', 'password')
   local protocols = {}
   for protocol_index = 1, 4 do
@@ -300,8 +358,10 @@ const GET_STATS_LUA = `
 export class Database {
   private redis: RedisClientType;
   private connected = false;
+  private deadReviveAfterMs: number;
 
   constructor(cfg: AppConfig) {
+    this.deadReviveAfterMs = cfg.deadReviveAfter * 1000;
     this.redis = createClient({
       socket: { host: cfg.redisHost, port: cfg.redisPort },
     });
@@ -375,6 +435,8 @@ export class Database {
             proxy.ip,
             String(proxy.port),
             proxy.username === undefined ? '0' : '1',
+            String(Date.now()),
+            String(this.deadReviveAfterMs),
           ],
         });
       }
@@ -419,7 +481,11 @@ export class Database {
       pipeline.hSetNX(key, 'last_http_status', '0');
       pipeline.hSetNX(key, 'last_error', '');
       pipeline.hSetNX(key, 'change_intervals', '[]');
-      pipeline.zAdd(SOURCE_QUEUE, { score: initialNextCheckAt, value: source.id, NX: true });
+      pipeline.zAdd(
+        SOURCE_QUEUE,
+        { score: initialNextCheckAt, value: source.id },
+        { NX: true },
+      );
     }
     await pipeline.execAsPipeline();
     return sources.length;
@@ -615,25 +681,54 @@ export class Database {
    * types 为协议类型集合（空表示全部，取所有协议的并集）。
    * 结果按代理地址排序，分页返回。
    */
-  async listAvailable(types: number[], page: number, count: number): Promise<AvailableItem[]> {
+  async listAvailable(types: number[], page: number, count: number, domain?: string): Promise<AvailableItem[]> {
     const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const start = (page - 1) * count;
     const rows = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
       keys,
-      arguments: [String(start), String(count)],
+      arguments: [String(start), String(count), domain ? `${DOMAIN_BLOCK_PREFIX}${domain}` : '', String(Date.now())],
     })) as unknown[];
     return this.parseAvailableRows(rows);
   }
 
   /** 随机返回一个可用代理。types 为协议类型集合（空表示全部）。 */
-  async randomAvailable(types: number[]): Promise<AvailableItem | null> {
+  async randomAvailable(types: number[], domain?: string): Promise<AvailableItem | null> {
     const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const row = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
       keys,
-      arguments: [],
+      arguments: [domain ? `${DOMAIN_BLOCK_PREFIX}${domain}` : '', String(Date.now())],
     })) as unknown[] | null;
     if (!row) return null;
     return this.parseAvailableRows(row)[0] ?? null;
+  }
+
+  /** 确认反馈的 IP 和端口属于代理池中的代理。认证信息和协议不参与确认。 */
+  async hasProxyEndpoint(ip: string, port: number): Promise<boolean> {
+    let cursor = '0';
+    do {
+      const reply = (await this.redis.sendCommand([
+        'SSCAN', KNOWN, cursor, 'COUNT', String(STATS_SCAN_BATCH_SIZE),
+      ])) as [string, string[]];
+      cursor = reply[0];
+      if (reply[1].length === 0) continue;
+      const pipeline = this.redis.multi();
+      for (const addrKey of reply[1]) {
+        pipeline.hmGet(this.proxyKeyFromAddr(addrKey), ['ip', 'port']);
+      }
+      const rows = await pipeline.execAsPipeline() as Array<[string | null, string | null]>;
+      if (rows.some(([storedIp, storedPort]) => storedIp === ip && Number(storedPort) === port)) return true;
+    } while (cursor !== '0');
+    return false;
+  }
+
+  /** 记录业务域名封禁。同一 IP 和域名的重复反馈只能延长，不能缩短。 */
+  async blockForDomain(ip: string, domain: string, blockedSeconds: number): Promise<number> {
+    const requestedUntil = Date.now() + blockedSeconds * 1000;
+    const key = `${DOMAIN_BLOCK_PREFIX}${domain}`;
+    return Number(await this.redis.eval(BLOCK_FOR_DOMAIN_LUA, {
+      keys: [key],
+      arguments: [ip, String(requestedUntil)],
+    }));
   }
 
   /** 将 Lua 返回的扁平行数据转换为接口对象，每行固定六项。 */

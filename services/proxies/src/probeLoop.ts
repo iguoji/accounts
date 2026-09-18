@@ -21,6 +21,25 @@ export interface ProbeLoopHandle {
 export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
   let stopped = false;
   let checking = 0;
+  let dispatched = 0;
+  let completed = 0;
+  let succeeded = 0;
+  let failed = 0;
+  let timedOut = 0;
+  let totalElapsedMs = 0;
+  let maxElapsedMs = 0;
+  let peakChecking = 0;
+  let loopErrors = 0;
+  const protocols = new Map<string, number>();
+  const summaryTimer = setInterval(() => {
+    if (!cfg.debug) return;
+    const averageMs = completed > 0 ? Math.round(totalElapsedMs / completed) : 0;
+    const protocolText = [...protocols.entries()].map(([name, count]) => `${name}=${count}`).join(',') || '无';
+    logger.debug(`[测活周期汇总] 派发=${dispatched} 完成=${completed} 可用=${succeeded} 失效=${failed} 硬超时=${timedOut} 当前并发=${checking} 峰值并发=${peakChecking} 平均耗时=${averageMs}ms 最大耗时=${maxElapsedMs}ms 协议成功={${protocolText}} 调度异常=${loopErrors}`);
+    dispatched = completed = succeeded = failed = timedOut = totalElapsedMs = maxElapsedMs = peakChecking = loopErrors = 0;
+    protocols.clear();
+  }, cfg.debugSummaryInterval * 1000);
+  summaryTimer.unref();
 
   /** 等待至有空闲槽位（checking < probeConcurrency）。 */
   const waitForSlot = async (): Promise<void> => {
@@ -35,7 +54,6 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
       try {
         // 并发已满：等待空位再继续
         if (checking >= cfg.probeConcurrency) {
-          logger.debug(`[调度] 并发已满(${checking}/${cfg.probeConcurrency})，等待空位`);
           await waitForSlot();
           continue;
         }
@@ -45,12 +63,9 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
         const candidates = await db.getProxiesToCheck(now, limit);
 
         if (candidates.length === 0) {
-          logger.debug(`[调度] 无到期候选（当前并发 ${checking}/${cfg.probeConcurrency}），等待 1 秒`);
           await new Promise((r) => setTimeout(r, ONE_SECOND));
           continue;
         }
-
-        logger.debug(`[调度] 取出 ${candidates.length} 个到期候选，当前并发 ${checking}/${cfg.probeConcurrency}，将派发测活`);
 
         const scheduled = await db.getProxyAddresses(candidates);
         if (scheduled.length !== candidates.length) {
@@ -65,6 +80,8 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
           const { ip, port, username, password } = proxy;
 
           checking++;
+          dispatched++;
+          peakChecking = Math.max(peakChecking, checking);
           // 单个代理最坏耗时兜底：
           // 4 个协议并发，每个协议最坏 = 超时（超时即放弃重试和备用渠道）+ 1 秒硬超时缓冲，
           // 再加 Redis 写入等开销，整体约 超时×1×2 + 10 秒缓冲。
@@ -72,15 +89,31 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
           // 绝不让单个坏代理永久占用并发槽位导致整个循环停转。
           const maxProbeMs = cfg.timeout * 1000 * 2 + 10000;
           const task = probeProxy({ addrKey, ip, port, username, password, db, cfg });
-          const timeoutGuard = new Promise<never>((resolve) =>
-            setTimeout(() => resolve(undefined as never), maxProbeMs),
-          );
+          let timeoutId: ReturnType<typeof setTimeout>;
+          const timeoutGuard = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error('hard-timeout')), maxProbeMs);
+          });
           void Promise.race([task, timeoutGuard])
-            .then(() => logger.debug(`[测活] ${addrKey} 完成，槽位释放`))
-            .catch((e) => logger.debug(`[测活] ${addrKey} 异常: ${String(e)}，槽位释放`))
-            .finally(() => checking--);
+            .then((result) => {
+              completed++;
+              if (result.ok) succeeded++; else failed++;
+              totalElapsedMs += result.elapsedMs;
+              maxElapsedMs = Math.max(maxElapsedMs, result.elapsedMs);
+              for (const protocol of result.protocols) protocols.set(protocol, (protocols.get(protocol) ?? 0) + 1);
+            })
+            .catch((e) => {
+              completed++;
+              failed++;
+              if (String(e).includes('hard-timeout')) timedOut++;
+              logger.debug(`[测活异常样本] ${addrKey} 任务异常: ${String(e)}`);
+            })
+            .finally(() => {
+              clearTimeout(timeoutId);
+              checking--;
+            });
         }
       } catch (e) {
+        loopErrors++;
         // 关键：单次迭代失败（如 Redis 还在加载数据、瞬时连接异常）绝不让循环退出。
         // 记录后等待数秒重试，保证循环具备自愈能力。
         // 这解决了"容器启动时 Redis 还在 LOADING 导致测活循环永久终止"的问题。
@@ -103,6 +136,7 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
   return {
     stop: () => {
       stopped = true;
+      clearInterval(summaryTimer);
     },
     getChecking: () => checking,
   };

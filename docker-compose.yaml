@@ -6,37 +6,51 @@ services:
     image: redis:7-alpine
     container_name: accounts-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --save 60 1000
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1000"
+      - --port
+      - "${REDIS_PORT}"
     ports:
-      # 宿主机 6379 → 容器 6379（其他子系统如需连接宿主机 Redis 也走这里）
-      - "6379:6379"
+      # Redis 监听端口与宿主机映射端口统一由根目录 .env 管理。
+      - "${REDIS_PORT}:${REDIS_PORT}"
     volumes:
       # Redis 持久化数据（AOF + RDB），即使删容器也不丢失
       - ./data/redis:/data
     environment:
-      - TZ=Asia/Shanghai
+      TZ: "${TZ}"
 
   proxies:
     build:
       context: .
       dockerfile: services/proxies/Dockerfile
-    image: accounts-proxies:0.1.2
+    image: accounts-proxies:latest
     container_name: accounts-proxies
     restart: unless-stopped
     depends_on:
       - redis
     environment:
-      # Redis 连接（指向同网络的 redis 服务）
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      # Redis 连接、代理池监听地址及端口均从根目录 .env 注入。
+      REDIS_HOST: "${REDIS_HOST}"
+      REDIS_PORT: "${REDIS_PORT}"
+      PROXIES_HOST: "${PROXIES_HOST}"
+      PROXIES_PORT: "${PROXIES_PORT}"
+      PROXIES_DEAD_REVIVE_AFTER: "${PROXIES_DEAD_REVIVE_AFTER:-21600}"
       # 调试模式：开启后测活/采集/调度的详细日志输出到 logs/proxies/debug.log
       # 每次服务启动会清空 debug.log 重新记录；排查问题后改回 false 关闭
-      - PROXIES_DEBUG=false
+      PROXIES_DEBUG: "${PROXIES_DEBUG:-false}"
+      PROXIES_DEBUG_LOG_MAX_MB: "${PROXIES_DEBUG_LOG_MAX_MB:-20}"
+      PROXIES_DEBUG_LOG_KEEP_FILES: "${PROXIES_DEBUG_LOG_KEEP_FILES:-3}"
+      PROXIES_DEBUG_SUMMARY_INTERVAL: "${PROXIES_DEBUG_SUMMARY_INTERVAL:-60}"
       # 让容器日志时间与宿主机一致（本地时区），默认东八区，可按需改 TZ
-      - TZ=Asia/Shanghai
+      TZ: "${TZ}"
     ports:
-      # 宿主机 3000 → 容器 3000（改宿主机端口请改左边；容器端口与 .env 的 PROXIES_PORT 对应）
-      - "3000:3000"
+      # 宿主机绑定地址、宿主机端口和容器监听端口统一由根目录 .env 管理。
+      - "${PROXIES_HOST}:${PROXIES_PORT}:${PROXIES_PORT}"
     volumes:
       # 日志持久化到宿主机，即使删容器也不丢失
       - ./logs:/srv/logs

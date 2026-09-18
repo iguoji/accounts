@@ -50,8 +50,11 @@ async function main(): Promise<void> {
   });
 
   const cfg = loadConfig();
-  setDebugEnabled(cfg.debug);
-  if (cfg.debug) logger.info('调试模式已开启，详细日志输出到 logs/proxies/debug.log');
+  setDebugEnabled(cfg.debug, cfg.debugLogMaxMb, cfg.debugLogKeepFiles);
+  if (cfg.debug) {
+    logger.info(`调试模式已开启：每 ${cfg.debugSummaryInterval} 秒汇总测活，debug.log 单文件上限 ${cfg.debugLogMaxMb} MB，保留 ${cfg.debugLogKeepFiles} 个历史文件`);
+    logger.debug(`[启动配置] API=${cfg.host}:${cfg.port} Redis=${cfg.redisHost}:${cfg.redisPort} 采集超时=${cfg.fetchTimeout}s 测活超时=${cfg.timeout}s 测活并发=${cfg.probeConcurrency} 汇总周期=${cfg.debugSummaryInterval}s`);
+  }
   const db = new Database(cfg);
   await db.connect();
   // 关键：等待 Redis 真正就绪（能响应命令）再启动业务。

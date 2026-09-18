@@ -103,6 +103,7 @@ async function processSource(db: Database, cfg: AppConfig, source: SourceState):
       scheduleReason: '同站点仍处于冷却期',
       error: '',
     }, cfg.sourceLogMaxLength);
+    logger.debug(`[采集] host=${hostname} result=site_cooldown next=${new Date(source.nextCheckAt).toISOString()} reason=同站点仍处于冷却期`);
     return;
   }
 
@@ -213,7 +214,9 @@ async function processSource(db: Database, cfg: AppConfig, source: SourceState):
     scheduleReason,
     error,
   }, cfg.sourceLogMaxLength);
+  const elapsedMs = Date.now() - startedAt;
   logger.info(`源头 ${source.url} 检查完成：${result}，新增 ${addedProxyCount}，复活 ${revivedProxyCount}`);
+  logger.debug(`[采集] host=${hostname} result=${result} http=${source.lastHttpStatus} elapsed=${elapsedMs}ms valid=${validProxyCount} contentChanged=${contentChanged} proxySetChanged=${proxySetChanged} added=${addedProxyCount} revived=${revivedProxyCount} next=${new Date(source.nextCheckAt).toISOString()} reason=${scheduleReason}${error ? ` error=${error}` : ''}`);
 }
 
 export interface CollectionHandle {

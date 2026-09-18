@@ -23,6 +23,29 @@ interface ApiQuery {
   protocols: number[]; // 空数组 = 全部
   page: number;
   count: number;
+  domain?: string;
+}
+
+class InvalidQueryError extends Error {}
+
+interface FeedbackBody {
+  ip: string;
+  port: number;
+  domain: string;
+  blocked_seconds: number;
+  reason?: string;
+}
+
+function normalizeDomain(input: string): string | null {
+  const value = input.trim();
+  if (!value) return null;
+  try {
+    const url = new URL(value.includes('://') ? value : `http://${value}`);
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+    return hostname || null;
+  } catch {
+    return null;
+  }
 }
 
 /** 把整数型查询参数解析为 >= 1 的整数，空或非法用默认值。 */
@@ -47,11 +70,44 @@ function parseQuery(rawUrl: string): ApiQuery {
     if (t !== undefined) protocols.push(t);
   }
 
+  const hasDomain = u.searchParams.has('domain');
+  const domain = hasDomain ? normalizeDomain(u.searchParams.get('domain') ?? '') : null;
+  if (hasDomain && !domain) throw new InvalidQueryError('invalid domain');
+
   return {
     protocols,
     page: parsePositiveInt(u.searchParams.get('page'), 1),
     count: parsePositiveInt(u.searchParams.get('count'), 20),
+    ...(domain ? { domain } : {}),
   };
+}
+
+async function readJsonBody(req: IncomingMessage, maxBytes = 16 * 1024): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxBytes) throw new Error('request body too large');
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function parseFeedbackBody(raw: unknown): FeedbackBody | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const body = raw as Record<string, unknown>;
+  const ip = typeof body.ip === 'string' ? body.ip.trim() : '';
+  const port = Number(body.port);
+  const domain = typeof body.domain === 'string' ? normalizeDomain(body.domain) : null;
+  const blockedSeconds = Number(body.blocked_seconds);
+  const reason = typeof body.reason === 'string'
+    ? body.reason.trim().replace(/[\r\n\t]+/g, ' ')
+    : undefined;
+  if (!ip || !domain || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (!Number.isSafeInteger(blockedSeconds) || blockedSeconds <= 0) return null;
+  if (reason !== undefined && reason.length > 1000) return null;
+  return { ip, port, domain, blocked_seconds: blockedSeconds, ...(reason ? { reason } : {}) };
 }
 
 function writeJson(res: ServerResponse, code: number, body: unknown): void {
@@ -68,6 +124,36 @@ export function createApiServer(db: Database, cfg: AppConfig, getChecking?: () =
     const url = req.url ?? '/';
     const pathname = new URL(url, 'http://localhost').pathname;
 
+    if (pathname === '/feedback' && req.method === 'POST') {
+      try {
+        const feedback = parseFeedbackBody(await readJsonBody(req));
+        if (!feedback) {
+          writeJson(res, 400, { error: 'invalid feedback' });
+          return;
+        }
+        if (!(await db.hasProxyEndpoint(feedback.ip, feedback.port))) {
+          writeJson(res, 404, { error: 'proxy not found' });
+          return;
+        }
+        const blockedUntil = await db.blockForDomain(
+          feedback.ip,
+          feedback.domain,
+          feedback.blocked_seconds,
+        );
+        logger.info(`收到业务封禁反馈: ${feedback.ip}:${feedback.port} domain=${feedback.domain} blocked_until=${blockedUntil}${feedback.reason ? ` reason=${feedback.reason}` : ''}`);
+        writeJson(res, 200, {
+          ip: feedback.ip,
+          port: feedback.port,
+          domain: feedback.domain,
+          blocked_until: blockedUntil,
+        });
+      } catch (e) {
+        logger.error(`反馈接口处理失败: ${String(e)}`);
+        writeJson(res, 400, { error: 'invalid request body' });
+      }
+      return;
+    }
+
     if (req.method !== 'GET') {
       writeJson(res, 405, { error: 'method not allowed' });
       return;
@@ -76,14 +162,14 @@ export function createApiServer(db: Database, cfg: AppConfig, getChecking?: () =
     try {
       if (pathname === '/proxies') {
         const q = parseQuery(url);
-        const items = await db.listAvailable(q.protocols, q.page, q.count);
+        const items = await db.listAvailable(q.protocols, q.page, q.count, q.domain);
         writeJson(res, 200, items);
         return;
       }
 
       if (pathname === '/proxy') {
         const q = parseQuery(url);
-        const pick = await db.randomAvailable(q.protocols);
+        const pick = await db.randomAvailable(q.protocols, q.domain);
         writeJson(res, 200, pick ?? {});
         return;
       }
@@ -97,13 +183,17 @@ export function createApiServer(db: Database, cfg: AppConfig, getChecking?: () =
 
       writeJson(res, 404, { error: 'not found' });
     } catch (e) {
+      if (e instanceof InvalidQueryError) {
+        writeJson(res, 400, { error: e.message });
+        return;
+      }
       logger.error(`API 处理失败(${url}): ${String(e)}`);
       writeJson(res, 500, { error: 'internal error' });
     }
   });
 
   server.listen(cfg.port, cfg.host, () => {
-    logger.info(`HTTP API 已启动: http://${cfg.host}:${cfg.port} (GET /proxies, /proxy, /stats)`);
+    logger.info(`HTTP API 已启动: http://${cfg.host}:${cfg.port} (GET /proxies, /proxy, /stats; POST /feedback)`);
   });
   return server;
 }

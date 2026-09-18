@@ -86,6 +86,8 @@ export interface AppConfig {
   retry: number;
   /** 连续失败达该次数软删 */
   maxConsecutiveFail: number;
+  /** 软删除后再次采集到时，允许复活前至少等待的秒数 */
+  deadReviveAfter: number;
   /** 同时探测的最大代理 IP 数 */
   probeConcurrency: number;
   host: string;
@@ -98,6 +100,12 @@ export interface AppConfig {
   redisPort: number;
   /** 调试模式开关：开启后输出测活/采集/调度的详细日志到 debug.log */
   debug: boolean;
+  /** 调试日志单个文件最大容量，MB */
+  debugLogMaxMb: number;
+  /** 调试日志轮转后保留的历史文件数量 */
+  debugLogKeepFiles: number;
+  /** 测活调试汇总周期，秒 */
+  debugSummaryInterval: number;
 }
 
 export function loadConfig(): AppConfig {
@@ -126,11 +134,15 @@ export function loadConfig(): AppConfig {
     timeout: intOr(env, 'PROXIES_TIMEOUT', 5),
     retry: Math.max(intOr(env, 'PROXIES_RETRY', 3), 1),
     maxConsecutiveFail: intOr(env, 'PROXIES_MAX_CONSECUTIVE_FAIL', 3),
+    deadReviveAfter: Math.max(intOr(env, 'PROXIES_DEAD_REVIVE_AFTER', 21600), 0),
     probeConcurrency: intOr(env, 'PROXIES_PROBE_CONCURRENCY', 50),
     primaryChannel: 'https://checkip.amazonaws.com',
     backupChannel: 'https://1.0.0.1/cdn-cgi/trace',
     redisHost: strOr(env, 'REDIS_HOST', 'redis'),
     redisPort: intOr(env, 'REDIS_PORT', 6379),
     debug: boolOr(env, 'PROXIES_DEBUG', false),
+    debugLogMaxMb: Math.max(intOr(env, 'PROXIES_DEBUG_LOG_MAX_MB', 20), 1),
+    debugLogKeepFiles: Math.max(intOr(env, 'PROXIES_DEBUG_LOG_KEEP_FILES', 3), 1),
+    debugSummaryInterval: Math.max(intOr(env, 'PROXIES_DEBUG_SUMMARY_INTERVAL', 60), 10),
   };
 }
