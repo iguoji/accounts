@@ -3,7 +3,9 @@
  *
  * 数据结构映射：
  *  - proxy:{ip}:{port}          Hash   单个代理的状态（status / consecutive_fail / checked_at）
- *  - check_queue                ZSet   调度队列，score = next_check_at（毫秒时间戳）
+ *  - check_queue:available      ZSet   可用代理复查队列，score = next_check_at
+ *  - check_queue:unchecked      ZSet   新入库未检测队列，score = next_check_at
+ *  - check_queue:cooldown       ZSet   失败代理复查队列，score = next_check_at
  *  - available:{type}           Set    按协议分组的可用代理集合（type = 1/2/3/4）
  *  - known_proxies              Set    所有已采集入库的代理（用于采集去重）
  *  - dead_pool                  Set    已软删的代理（连续失败达上限）
@@ -13,7 +15,7 @@
  *  - meta:last_check            String 最近一次测活时间
  *
  * 时间存储约定：
- *  - check_queue 的 score 与 checked_at 使用毫秒级整数（Date.now()），便于与"当前时间"直接比较
+ *  - 三个 check_queue:* 的 score 与 checked_at 使用毫秒级整数（Date.now()），便于与"当前时间"直接比较
  *  - meta:last_collect / meta:last_check 为 "YYYY-MM-DD HH:MM:SS" 文本（仅供展示）
  */
 import { createClient, type RedisClientType } from 'redis';
@@ -90,7 +92,16 @@ export interface StatsItem {
 }
 
 const KNOWN = 'known_proxies';
-const QUEUE = 'check_queue';
+const LEGACY_QUEUE = 'check_queue';
+const AVAILABLE_QUEUE = 'check_queue:available';
+const UNCHECKED_QUEUE = 'check_queue:unchecked';
+const COOLDOWN_QUEUE = 'check_queue:cooldown';
+const PROBE_QUEUES = [AVAILABLE_QUEUE, UNCHECKED_QUEUE, COOLDOWN_QUEUE] as const;
+export type ProbeQueueBucket = 'available' | 'unchecked' | 'cooldown';
+export interface ProbeCandidate {
+  addrKey: string;
+  bucket: ProbeQueueBucket;
+}
 const DEAD = 'dead_pool';
 const STATS = 'stats';
 const ALL_AVAIL_KEYS = ['available:1', 'available:2', 'available:3', 'available:4'];
@@ -163,10 +174,12 @@ const UPSERT_ADDRESS_LUA = `
       'dead_at', '',
       'ip', ip,
       'port', port)
-    redis.call('ZADD', KEYS[3], 0, addr)
-    redis.call('HINCRBY', KEYS[4], 'dead', -1)
-    redis.call('HINCRBY', KEYS[4], 'unchecked', 1)
-    redis.call('HINCRBY', KEYS[4], 'total', 1)
+    redis.call('ZREM', KEYS[3], addr)
+    redis.call('ZREM', KEYS[4], addr)
+    redis.call('ZADD', KEYS[5], 0, addr)
+    redis.call('HINCRBY', KEYS[6], 'dead', -1)
+    redis.call('HINCRBY', KEYS[6], 'unchecked', 1)
+    redis.call('HINCRBY', KEYS[6], 'total', 1)
     return 2
   end
 
@@ -181,9 +194,9 @@ const UPSERT_ADDRESS_LUA = `
   if has_auth == '1' then
     redis.call('HSET', proxy_key, 'username', username, 'password', password)
   end
-  redis.call('ZADD', KEYS[3], 0, addr)
-  redis.call('HINCRBY', KEYS[4], 'unchecked', 1)
-  redis.call('HINCRBY', KEYS[4], 'total', 1)
+  redis.call('ZADD', KEYS[5], 0, addr)
+  redis.call('HINCRBY', KEYS[6], 'unchecked', 1)
+  redis.call('HINCRBY', KEYS[6], 'total', 1)
   return 1
 `;
 
@@ -198,7 +211,7 @@ const FINALIZE_PROBE_LUA = `
   local next_check = ARGV[7]
   local last_check = ARGV[8]
 
-  local was_dead = redis.call('SISMEMBER', KEYS[2], addr) == 1
+  local was_dead = redis.call('SISMEMBER', KEYS[4], addr) == 1
   local old_status = redis.call('HGET', proxy_key, 'status') or '0'
   local old_checked_at = redis.call('HGET', proxy_key, 'checked_at') or ''
   local old_bucket
@@ -214,40 +227,42 @@ const FINALIZE_PROBE_LUA = `
 
   for i = 1, 4 do
     if ARGV[8 + i] == '1' then
-      redis.call('SADD', KEYS[3 + i], addr)
+      redis.call('SADD', KEYS[5 + i], addr)
     else
-      redis.call('SREM', KEYS[3 + i], addr)
+      redis.call('SREM', KEYS[5 + i], addr)
     end
   end
 
   local new_bucket
+  redis.call('ZREM', KEYS[1], addr)
+  redis.call('ZREM', KEYS[2], addr)
+  redis.call('ZREM', KEYS[3], addr)
   if ok then
     redis.call('HSET', proxy_key, 'status', '1', 'consecutive_fail', '0', 'checked_at', now, 'dead_at', '')
     redis.call('ZADD', KEYS[1], next_check, addr)
-    redis.call('SREM', KEYS[2], addr)
+    redis.call('SREM', KEYS[4], addr)
     new_bucket = 'available'
   else
     redis.call('HSET', proxy_key, 'status', '0', 'consecutive_fail', consecutive_fail, 'checked_at', now)
     if consecutive_fail >= max_fail then
-      redis.call('SADD', KEYS[2], addr)
+      redis.call('SADD', KEYS[4], addr)
       redis.call('HSET', proxy_key, 'dead_at', now)
-      redis.call('ZREM', KEYS[1], addr)
-      for i = 1, 4 do redis.call('SREM', KEYS[3 + i], addr) end
+      for i = 1, 4 do redis.call('SREM', KEYS[5 + i], addr) end
       new_bucket = 'dead'
     else
-      redis.call('ZADD', KEYS[1], next_check, addr)
+      redis.call('ZADD', KEYS[3], next_check, addr)
       new_bucket = 'cooldown'
     end
   end
 
   if old_bucket ~= new_bucket then
-    redis.call('HINCRBY', KEYS[3], old_bucket, -1)
-    redis.call('HINCRBY', KEYS[3], new_bucket, 1)
-    if old_bucket == 'dead' then redis.call('HINCRBY', KEYS[3], 'total', 1) end
-    if new_bucket == 'dead' then redis.call('HINCRBY', KEYS[3], 'total', -1) end
+    redis.call('HINCRBY', KEYS[5], old_bucket, -1)
+    redis.call('HINCRBY', KEYS[5], new_bucket, 1)
+    if old_bucket == 'dead' then redis.call('HINCRBY', KEYS[5], 'total', 1) end
+    if new_bucket == 'dead' then redis.call('HINCRBY', KEYS[5], 'total', -1) end
   end
-  redis.call('SET', KEYS[8], last_check)
-  redis.call('INCRBY', KEYS[9], 1)
+  redis.call('SET', KEYS[10], last_check)
+  redis.call('INCRBY', KEYS[11], 1)
   return new_bucket
 `;
 
@@ -359,6 +374,8 @@ export class Database {
   private redis: RedisClientType;
   private connected = false;
   private deadReviveAfterMs: number;
+  /** 跨调度轮次保存 5:3:2 周期位置，避免少量空闲槽位长期偏向某一类。 */
+  private probeQuotaCursor = 0;
 
   constructor(cfg: AppConfig) {
     this.deadReviveAfterMs = cfg.deadReviveAfter * 1000;
@@ -411,7 +428,7 @@ export class Database {
 
   /**
    * 批量入库新地址。只处理 known_proxies 中不存在的（新增），已存在的跳过。
-   * 新增的代理加入 check_queue（score=0，立即可测）和 known_proxies。
+   * 新增的代理加入 check_queue:unchecked（score=0，立即可测）和 known_proxies。
    * 已软删（在 dead_pool 里）的代理被重新采集时复活：移出 dead_pool，重置状态。
    * 同一 ip:port 但不同认证视为不同代理。
    */
@@ -427,7 +444,7 @@ export class Database {
       const pipeline = this.redis.multi();
       for (const [addrKey, proxy] of batch) {
         pipeline.eval(UPSERT_ADDRESS_LUA, {
-          keys: [KNOWN, DEAD, QUEUE, STATS],
+          keys: [KNOWN, DEAD, AVAILABLE_QUEUE, COOLDOWN_QUEUE, UNCHECKED_QUEUE, STATS],
           arguments: [
             addrKey,
             this.proxyKeyFromAddr(addrKey),
@@ -609,23 +626,72 @@ export class Database {
    * 原子取出到期候选（score <= nowMs），取出的代理从队列移除。
    * 测活完成后再由 finalizeProbe 放回（带新的 score = next_check_at）。
    */
-  async getProxiesToCheck(nowMs: number, limit: number): Promise<string[]> {
-    return (await this.redis.eval(POP_DUE_LUA, {
-      keys: [QUEUE],
-      arguments: [String(nowMs), String(limit)],
-    })) as string[];
+  async getProxiesToCheck(nowMs: number, limit: number): Promise<ProbeCandidate[]> {
+    if (limit <= 0) return [];
+    const buckets: Array<{ bucket: ProbeQueueBucket; queue: string }> = [
+      { bucket: 'available', queue: AVAILABLE_QUEUE },
+      { bucket: 'unchecked', queue: UNCHECKED_QUEUE },
+      { bucket: 'cooldown', queue: COOLDOWN_QUEUE },
+    ];
+    // 每十个槽位严格分配为 5:3:2，并将三类任务交错排列。
+    // 游标跨调用保存，即使每轮只腾出一个槽位，长期比例仍保持 5:3:2。
+    const quotaCycle: ProbeQueueBucket[] = [
+      'available', 'unchecked', 'available', 'cooldown', 'available',
+      'unchecked', 'available', 'cooldown', 'available', 'unchecked',
+    ];
+    const quotas = buckets.map(() => 0);
+    for (let i = 0; i < limit; i++) {
+      const bucket = quotaCycle[(this.probeQuotaCursor + i) % quotaCycle.length];
+      const index = buckets.findIndex((item) => item.bucket === bucket);
+      quotas[index]++;
+    }
+    this.probeQuotaCursor = (this.probeQuotaCursor + limit) % quotaCycle.length;
+
+    const candidates: ProbeCandidate[] = [];
+    for (let i = 0; i < buckets.length; i++) {
+      if (quotas[i] === 0) continue;
+      const rows = (await this.redis.eval(POP_DUE_LUA, {
+        keys: [buckets[i].queue],
+        arguments: [String(nowMs), String(quotas[i])],
+      })) as string[];
+      candidates.push(...rows.map((addrKey) => ({ addrKey, bucket: buckets[i].bucket })));
+    }
+
+    let remaining = limit - candidates.length;
+    while (remaining > 0) {
+      let added = 0;
+      for (const item of buckets) {
+        if (remaining === 0) break;
+        const rows = (await this.redis.eval(POP_DUE_LUA, {
+          keys: [item.queue],
+          arguments: [String(nowMs), String(remaining)],
+        })) as string[];
+        candidates.push(...rows.map((addrKey) => ({ addrKey, bucket: item.bucket })));
+        remaining -= rows.length;
+        added += rows.length;
+      }
+      if (added === 0) break;
+    }
+    return candidates;
   }
 
   /**
    * 将已从调度队列取出、但暂时无法构造连接信息的候选重新入队。
    * 延迟重试可以避免异常数据形成无间隔的调度热循环，同时防止候选永久漏检。
    */
-  async requeueProbeCandidates(addrKeys: string[], nextCheckAt: number): Promise<void> {
-    if (addrKeys.length === 0) return;
-    await this.redis.zAdd(
-      QUEUE,
-      addrKeys.map((value) => ({ score: nextCheckAt, value })),
-    );
+  async requeueProbeCandidates(candidates: ProbeCandidate[], nextCheckAt: number): Promise<void> {
+    if (candidates.length === 0) return;
+    const pipeline = this.redis.multi();
+    for (const bucket of ['available', 'unchecked', 'cooldown'] as const) {
+      const values = candidates
+        .filter((candidate) => candidate.bucket === bucket)
+        .map(({ addrKey: value }) => ({ score: nextCheckAt, value }));
+      if (values.length > 0) {
+        const queue = bucket === 'available' ? AVAILABLE_QUEUE : bucket === 'unchecked' ? UNCHECKED_QUEUE : COOLDOWN_QUEUE;
+        pipeline.zAdd(queue, values);
+      }
+    }
+    await pipeline.execAsPipeline();
   }
 
   /** 读取单个代理的连续失败次数。 */
@@ -658,7 +724,7 @@ export class Database {
       : Math.max(cfg.interval, Math.pow(cfg.intervalBase, consecutiveFail) * cfg.interval) * 1000;
     const resultByType = new Map(protocolResults.map((result) => [result.type, result.ok]));
     await this.redis.eval(FINALIZE_PROBE_LUA, {
-      keys: [QUEUE, DEAD, STATS, ...ALL_AVAIL_KEYS, 'meta:last_check', 'meta:check_count'],
+      keys: [AVAILABLE_QUEUE, UNCHECKED_QUEUE, COOLDOWN_QUEUE, DEAD, STATS, ...ALL_AVAIL_KEYS, 'meta:last_check', 'meta:check_count'],
       arguments: [
         addrKey,
         this.proxyKeyFromAddr(addrKey),
@@ -836,14 +902,15 @@ export class Database {
   /**
    * 启动业务前修复调度队列。
    *
-   * 测活候选取出时会暂时从 check_queue 删除。如果进程恰好在测活完成前退出，
+   * 测活候选取出时会暂时从分类队列删除。如果进程恰好在测活完成前退出，
    * 这些代理来不及重新入队，重启后将永久漏检。这里分批扫描代理全集，把所有
    * 未软删且不在队列中的代理重新加入队列，并立即安排测活；同时移除死亡代理
    * 可能残留的队列成员。
    */
-  async reconcileCheckQueue(): Promise<{ restored: number; removedDead: number }> {
+  async reconcileCheckQueue(): Promise<{ restored: number; migrated: number; removedDead: number }> {
     let cursor = '0';
     let restored = 0;
+    let migrated = 0;
     let removedDead = 0;
 
     do {
@@ -854,32 +921,53 @@ export class Database {
       const addrKeys = reply[1];
       if (addrKeys.length === 0) continue;
 
-      const [deadFlags, queueScores] = await Promise.all([
+      const statePipeline = this.redis.multi();
+      for (const addrKey of addrKeys) statePipeline.hmGet(this.proxyKeyFromAddr(addrKey), ['status', 'checked_at']);
+      const [deadFlags, legacyScores, availableScores, uncheckedScores, cooldownScores, states] = await Promise.all([
         this.redis.sendCommand(['SMISMEMBER', DEAD, ...addrKeys]) as Promise<number[]>,
-        this.redis.sendCommand(['ZMSCORE', QUEUE, ...addrKeys]) as Promise<Array<string | null>>,
+        this.redis.sendCommand(['ZMSCORE', LEGACY_QUEUE, ...addrKeys]) as Promise<Array<string | null>>,
+        this.redis.sendCommand(['ZMSCORE', AVAILABLE_QUEUE, ...addrKeys]) as Promise<Array<string | null>>,
+        this.redis.sendCommand(['ZMSCORE', UNCHECKED_QUEUE, ...addrKeys]) as Promise<Array<string | null>>,
+        this.redis.sendCommand(['ZMSCORE', COOLDOWN_QUEUE, ...addrKeys]) as Promise<Array<string | null>>,
+        statePipeline.execAsPipeline() as Promise<Array<[string | null, string | null]>>,
       ]);
       const pipeline = this.redis.multi();
       let batchCommands = 0;
 
       for (let i = 0; i < addrKeys.length; i++) {
-        const inQueue = queueScores[i] !== null;
+        const scores = [availableScores[i], uncheckedScores[i], cooldownScores[i]];
+        const inAnyQueue = scores.some((score) => score !== null);
         if (deadFlags[i]) {
-          if (inQueue) {
-            pipeline.zRem(QUEUE, addrKeys[i]);
+          if (legacyScores[i] !== null || inAnyQueue) {
+            pipeline.zRem(LEGACY_QUEUE, addrKeys[i]);
+            for (const queue of PROBE_QUEUES) pipeline.zRem(queue, addrKeys[i]);
             removedDead++;
-            batchCommands++;
+            batchCommands += 4;
           }
-        } else if (!inQueue) {
-          pipeline.zAdd(QUEUE, { score: 0, value: addrKeys[i] });
-          restored++;
-          batchCommands++;
+        } else {
+          const [status, checkedAt] = states[i] ?? [];
+          const targetIndex = status === '1' ? 0 : (!checkedAt || checkedAt === '0' ? 1 : 2);
+          const targetQueue = PROBE_QUEUES[targetIndex];
+          const existingScore = scores[targetIndex];
+          const legacyScore = legacyScores[i];
+          const score = Number(existingScore ?? legacyScore ?? scores.find((value) => value !== null) ?? 0);
+          const correctlyQueued = existingScore !== null && scores.every((value, index) => index === targetIndex || value === null);
+          if (!correctlyQueued || legacyScore !== null) {
+            for (const queue of PROBE_QUEUES) pipeline.zRem(queue, addrKeys[i]);
+            pipeline.zAdd(targetQueue, { score, value: addrKeys[i] });
+            pipeline.zRem(LEGACY_QUEUE, addrKeys[i]);
+            if (!inAnyQueue && legacyScore === null) restored++;
+            else migrated++;
+            batchCommands += 5;
+          }
         }
       }
 
       if (batchCommands > 0) await pipeline.execAsPipeline();
     } while (cursor !== '0');
 
-    return { restored, removedDead };
+    await this.redis.del(LEGACY_QUEUE);
+    return { restored, migrated, removedDead };
   }
 
   /**

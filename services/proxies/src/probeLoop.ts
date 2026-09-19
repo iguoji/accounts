@@ -67,10 +67,11 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
           continue;
         }
 
-        const scheduled = await db.getProxyAddresses(candidates);
+        const candidateKeys = candidates.map(({ addrKey }) => addrKey);
+        const scheduled = await db.getProxyAddresses(candidateKeys);
         if (scheduled.length !== candidates.length) {
           const scheduledKeys = new Set(scheduled.map(({ addrKey }) => addrKey));
-          const rejected = candidates.filter((addrKey) => !scheduledKeys.has(addrKey));
+          const rejected = candidates.filter(({ addrKey }) => !scheduledKeys.has(addrKey));
           await db.requeueProbeCandidates(rejected, Date.now() + 5000);
           logger.warn(
             `[调度] ${rejected.length} 个候选的地址信息无效，已延迟 5 秒重新入队，避免永久漏检`,

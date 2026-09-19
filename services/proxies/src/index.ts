@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   logger.info('代理统计已完成分批校准');
   const queueRepair = await db.reconcileCheckQueue();
   logger.info(
-    `测活队列已完成分批校准，恢复 ${queueRepair.restored} 个漏失代理，清理 ${queueRepair.removedDead} 个死亡代理`,
+    `测活分类队列已完成分批校准，迁移或纠正 ${queueRepair.migrated} 个代理，恢复 ${queueRepair.restored} 个漏失代理，清理 ${queueRepair.removedDead} 个死亡代理`,
   );
 
   cleanOldLogs();
