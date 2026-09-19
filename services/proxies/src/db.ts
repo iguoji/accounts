@@ -4,7 +4,7 @@
  * 数据结构映射：
  *  - proxy:{ip}:{port}          Hash   单个代理的状态（status / consecutive_fail / checked_at）
  *  - check_queue                ZSet   调度队列，score = next_check_at（毫秒时间戳）
- *  - available:{type}           Set    按协议分组的可用代理集合（type = 2/3/4）
+ *  - available:{type}           Set    按协议分组的可用代理集合（type = 1/2/3/4）
  *  - known_proxies              Set    所有已采集入库的代理（用于采集去重）
  *  - dead_pool                  Set    已软删的代理（连续失败达上限）
  *  - stats                      Hash   统计计数器（total / available / dead / checked / unchecked）
@@ -93,9 +93,7 @@ const KNOWN = 'known_proxies';
 const QUEUE = 'check_queue';
 const DEAD = 'dead_pool';
 const STATS = 'stats';
-const LEGACY_HTTP_AVAIL_KEY = 'available:1';
-const ACTIVE_AVAIL_KEYS = ['available:2', 'available:3', 'available:4'];
-const ALL_AVAIL_KEYS = [LEGACY_HTTP_AVAIL_KEY, ...ACTIVE_AVAIL_KEYS];
+const ALL_AVAIL_KEYS = ['available:1', 'available:2', 'available:3', 'available:4'];
 const UPSERT_BATCH_SIZE = 1000;
 const STATS_SCAN_BATCH_SIZE = 1000;
 const SOURCE_QUEUE = 'source_probe_queue';
@@ -685,7 +683,7 @@ export class Database {
    * 结果按代理地址排序，分页返回。
    */
   async listAvailable(types: number[], page: number, count: number, domain?: string): Promise<AvailableItem[]> {
-    const keys = types.length === 0 ? ACTIVE_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const start = (page - 1) * count;
     const rows = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
       keys,
@@ -696,7 +694,7 @@ export class Database {
 
   /** 随机返回一个可用代理。types 为协议类型集合（空表示全部）。 */
   async randomAvailable(types: number[], domain?: string): Promise<AvailableItem | null> {
-    const keys = types.length === 0 ? ACTIVE_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const row = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
       keys,
       arguments: [domain ? `${DOMAIN_BLOCK_PREFIX}${domain}` : '', String(Date.now())],

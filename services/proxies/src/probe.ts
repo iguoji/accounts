@@ -1,5 +1,5 @@
 /**
- * 测活：对单个代理分别以 HTTPS / SOCKS4 / SOCKS5 三个协议并发探测，
+ * 测活：对单个代理分别以 HTTP / HTTPS / SOCKS4 / SOCKS5 四个协议并发探测，
  * 成功标准为「通过代理访问测活渠道，返回 HTTP 200 且响应体含非空 IP 文本」。
  * 主备渠道都是全球知名网站，理论上永远可用；仅当主渠道返回 404（渠道自身页面问题）
  * 时才回退到备用渠道，其他失败（超时、连接错误等）一律判定为代理失效。
@@ -49,6 +49,7 @@ function buildAgent(type: ProtocolType, ip: string, port: number, username?: str
   const proxyUri = `${typeToScheme(type)}://${auth}${host}:${port}`;
   let agent: http.Agent;
   switch (type) {
+    case 1: // HTTP 代理：明文连接代理，通过 CONNECT 隧道访问 HTTPS 渠道
     case 2: // HTTPS 代理：代理端本身用 TLS
       agent = new HttpsProxyAgent(proxyUri) as unknown as http.Agent;
       break;
@@ -230,9 +231,9 @@ async function probeProtocol(
 }
 
 /**
- * 对单个代理测活：并发探测三种协议，再一次性写入完整结果。
- * 单个协议即使出现未预期异常，也会转换为失败结果。数据库写回时还会
- * 清理历史 HTTP 索引，避免已移除协议继续出现在查询结果中。
+ * 对单个代理测活：并发探测四种协议，再一次性写入完整结果。
+ * 单个协议即使出现未预期异常，也会转换为失败结果，保证全部协议索引
+ * 都会被本轮结果覆盖，避免代理状态与 available 索引不一致。
  */
 export async function probeProxy(args: {
   addrKey: string;

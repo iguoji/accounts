@@ -3,7 +3,7 @@
   "version": "0.1.6",
   "private": true,
   "type": "module",
-  "description": "代理池：定期采集代理IP、三协议测活、维护可用代理池，并提供对内HTTP API",
+  "description": "代理池：定期采集代理IP、四协议测活、维护可用代理池，并提供对内HTTP API",
   "engines": {
     "node": ">=24.0.0"
   },
