@@ -69,6 +69,9 @@ function parseQuery(rawUrl: string): ApiQuery {
     const t = NAME_TO_TYPE[n];
     if (t !== undefined) protocols.push(t);
   }
+  if (names.length > 0 && protocols.length === 0) {
+    throw new InvalidQueryError('invalid protocols');
+  }
 
   const hasDomain = u.searchParams.has('domain');
   const domain = hasDomain ? normalizeDomain(u.searchParams.get('domain') ?? '') : null;

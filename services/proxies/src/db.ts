@@ -4,7 +4,7 @@
  * 数据结构映射：
  *  - proxy:{ip}:{port}          Hash   单个代理的状态（status / consecutive_fail / checked_at）
  *  - check_queue                ZSet   调度队列，score = next_check_at（毫秒时间戳）
- *  - available:{type}           Set    按协议分组的可用代理集合（type = 1/2/3/4）
+ *  - available:{type}           Set    按协议分组的可用代理集合（type = 2/3/4）
  *  - known_proxies              Set    所有已采集入库的代理（用于采集去重）
  *  - dead_pool                  Set    已软删的代理（连续失败达上限）
  *  - stats                      Hash   统计计数器（total / available / dead / checked / unchecked）
@@ -93,7 +93,9 @@ const KNOWN = 'known_proxies';
 const QUEUE = 'check_queue';
 const DEAD = 'dead_pool';
 const STATS = 'stats';
-const ALL_AVAIL_KEYS = ['available:1', 'available:2', 'available:3', 'available:4'];
+const LEGACY_HTTP_AVAIL_KEY = 'available:1';
+const ACTIVE_AVAIL_KEYS = ['available:2', 'available:3', 'available:4'];
+const ALL_AVAIL_KEYS = [LEGACY_HTTP_AVAIL_KEY, ...ACTIVE_AVAIL_KEYS];
 const UPSERT_BATCH_SIZE = 1000;
 const STATS_SCAN_BATCH_SIZE = 1000;
 const SOURCE_QUEUE = 'source_probe_queue';
@@ -641,7 +643,7 @@ export class Database {
   /**
    * 一次性写入一个代理的全部协议结果、整体状态、调度时间和测活元数据。
    *
-   * 原实现会为四种协议分别往返 Redis，再单独更新代理状态、时间和计数。
+   * 原实现会为各协议分别往返 Redis，再单独更新代理状态、时间和计数。
    * 这里把同一次测活产生的所有写操作合并到一个 pipeline，减少网络往返和
    * Redis 命令调度开销，同时保证同一轮结果按顺序一次提交。
    */
@@ -683,7 +685,7 @@ export class Database {
    * 结果按代理地址排序，分页返回。
    */
   async listAvailable(types: number[], page: number, count: number, domain?: string): Promise<AvailableItem[]> {
-    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? ACTIVE_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const start = (page - 1) * count;
     const rows = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
       keys,
@@ -694,7 +696,7 @@ export class Database {
 
   /** 随机返回一个可用代理。types 为协议类型集合（空表示全部）。 */
   async randomAvailable(types: number[], domain?: string): Promise<AvailableItem | null> {
-    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? ACTIVE_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const row = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
       keys,
       arguments: [domain ? `${DOMAIN_BLOCK_PREFIX}${domain}` : '', String(Date.now())],
@@ -750,7 +752,9 @@ export class Database {
       const item: AvailableItem = {
         ip: parsed.ip,
         port: parsed.port,
-        protocols: protocolTypes.map((type) => TYPE_TO_NAME[type] ?? 'http'),
+        protocols: protocolTypes
+          .map((type) => TYPE_TO_NAME[type])
+          .filter((name): name is string => name !== undefined),
       };
       if (username !== null) item.username = username;
       if (password !== null) item.password = password;
