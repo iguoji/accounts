@@ -138,7 +138,7 @@ export function loadConfig(): AppConfig {
     deadReviveAfter: Math.max(intOr(env, 'PROXIES_DEAD_REVIVE_AFTER', 21600), 0),
     probeConcurrency: intOr(env, 'PROXIES_PROBE_CONCURRENCY', 50),
     primaryChannel: 'https://checkip.amazonaws.com',
-    backupChannel: 'https://1.0.0.1/cdn-cgi/trace',
+    backupChannel: 'https://icanhazip.com',
     redisHost: strOr(env, 'REDIS_HOST', 'redis'),
     redisPort: intOr(env, 'REDIS_PORT', 6379),
     redisPassword: strOr(env, 'REDIS_PASSWORD', ''),

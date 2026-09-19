@@ -104,7 +104,10 @@ export interface ProbeCandidate {
 }
 const DEAD = 'dead_pool';
 const STATS = 'stats';
+// 完整协议索引仍需保留四项，供测活结果原子覆盖并清理历史 HTTPS 状态。
 const ALL_AVAIL_KEYS = ['available:1', 'available:2', 'available:3', 'available:4'];
+// HTTPS（type=2）当前暂停，因此默认查询不能返回历史 available:2 数据。
+const QUERY_AVAIL_KEYS = ['available:1', 'available:3', 'available:4'];
 const UPSERT_BATCH_SIZE = 1000;
 const STATS_SCAN_BATCH_SIZE = 1000;
 const SOURCE_QUEUE = 'source_probe_queue';
@@ -719,8 +722,11 @@ export class Database {
     cfg: AppConfig,
   ): Promise<void> {
     const now = Date.now();
+    // 公共免费代理可能在刚通过测活后很快失效。可用代理固定在 60 秒内复查，
+    // 避免已经断开的地址继续在 /proxies 中暴露长达默认的 5 分钟。
+    const availableRecheckMs = Math.min(cfg.interval * 1000, 60_000);
     const backoff = ok
-      ? cfg.interval * 1000
+      ? availableRecheckMs
       : Math.max(cfg.interval, Math.pow(cfg.intervalBase, consecutiveFail) * cfg.interval) * 1000;
     const resultByType = new Map(protocolResults.map((result) => [result.type, result.ok]));
     await this.redis.eval(FINALIZE_PROBE_LUA, {
@@ -749,7 +755,7 @@ export class Database {
    * 结果按代理地址排序，分页返回。
    */
   async listAvailable(types: number[], page: number, count: number, domain?: string): Promise<AvailableItem[]> {
-    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? QUERY_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const start = (page - 1) * count;
     const rows = (await this.redis.eval(PAGE_AVAILABLE_LUA, {
       keys,
@@ -760,7 +766,7 @@ export class Database {
 
   /** 随机返回一个可用代理。types 为协议类型集合（空表示全部）。 */
   async randomAvailable(types: number[], domain?: string): Promise<AvailableItem | null> {
-    const keys = types.length === 0 ? ALL_AVAIL_KEYS : types.map((t) => `available:${t}`);
+    const keys = types.length === 0 ? QUERY_AVAIL_KEYS : types.map((t) => `available:${t}`);
     const row = (await this.redis.eval(RANDOM_AVAILABLE_LUA, {
       keys,
       arguments: [domain ? `${DOMAIN_BLOCK_PREFIX}${domain}` : '', String(Date.now())],

@@ -84,11 +84,13 @@ export function startProbeLoop(db: Database, cfg: AppConfig): ProbeLoopHandle {
           dispatched++;
           peakChecking = Math.max(peakChecking, checking);
           // 单个代理最坏耗时兜底：
-          // 4 个协议并发，每个协议最坏 = 超时（超时即放弃重试和备用渠道）+ 1 秒硬超时缓冲，
-          // 再加 Redis 写入等开销，整体约 超时×1×2 + 10 秒缓冲。
+          // 3 个协议并发。HTTP CONNECT 严格测活最多包含：直连出口主备渠道各一次，
+          // 再加两个独立代理渠道连续两轮，共 6 次顺序请求。每次请求都有
+          // timeout+1 秒内部硬超时，因此任务级上限必须覆盖这条最长调用链。
+          // 最后额外预留 10 秒给 Redis 读写、事件回调和 Agent 清理。
           // 超出此值说明底层任务出现异常卡顿，主动取消完整测活调用链。
           // 并发槽位在请求与 Agent 清理完成、任务真正退出后释放，避免后台残留请求突破并发上限。
-          const maxProbeMs = cfg.timeout * 1000 * 2 + 10000;
+          const maxProbeMs = (cfg.timeout * 1000 + 1000) * 6 + 10000;
           const controller = new AbortController();
           const timeoutId = setTimeout(() => {
             controller.abort(new Error('hard-timeout'));

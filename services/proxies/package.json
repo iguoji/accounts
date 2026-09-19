@@ -1,6 +1,6 @@
 {
   "name": "accounts-proxies",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "description": "代理池：定期采集代理IP、四协议测活、维护可用代理池，并提供对内HTTP API",

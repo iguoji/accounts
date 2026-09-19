@@ -1,4 +1,4 @@
-/** 四种对外提供的代理协议常量。 */
+/** 协议编号保持稳定，HTTPS 编号 2 暂时保留用于兼容历史 Redis 数据。 */
 export const PROTOCOLS = {
   HTTP: 1,
   HTTPS: 2,
@@ -19,13 +19,12 @@ export const TYPE_TO_NAME: Record<number, string> = {
 /** 协议名字 → 数字。 */
 export const NAME_TO_TYPE: Record<string, number> = {
   http: PROTOCOLS.HTTP,
-  https: PROTOCOLS.HTTPS,
   socks4: PROTOCOLS.SOCKS4,
   socks5: PROTOCOLS.SOCKS5,
 };
 
-/** 全部协议类型，用于测活。 */
-export const ALL_TYPES: ProtocolType[] = [PROTOCOLS.HTTP, PROTOCOLS.HTTPS, PROTOCOLS.SOCKS4, PROTOCOLS.SOCKS5];
+/** 当前启用的协议类型，用于测活；HTTPS 暂停检测以节省请求。 */
+export const ALL_TYPES: ProtocolType[] = [PROTOCOLS.HTTP, PROTOCOLS.SOCKS4, PROTOCOLS.SOCKS5];
 
 /** 协议类型 → 代理连接使用的 URL scheme。 */
 export function typeToScheme(type: number): string {
